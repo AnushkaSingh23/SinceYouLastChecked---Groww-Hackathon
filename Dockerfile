@@ -29,9 +29,13 @@ ENV NEXT_TELEMETRY_DISABLED=1
 ENV DATABASE_URL="file:/data/dev.db"
 RUN npm run build
 
-# Where the SQLite file lives. Mount a persistent volume here or every restart
-# wipes the watchlists.
-VOLUME ["/data"]
+# Where the SQLite file lives. Just create the directory — do NOT use a VOLUME
+# instruction: Railway rejects it outright ("docker VOLUME at Line 34 is not
+# supported, use Railway Volumes") and the build fails at parse time in ~3s.
+# Persistence is configured on the platform side by mounting a volume at
+# /data; without one this is an ordinary container directory, which still
+# works — the entrypoint re-migrates and re-seeds on every boot.
+RUN mkdir -p /data
 
 ENV NODE_ENV=production
 ENV PORT=3000
