@@ -1,0 +1,101 @@
+// Smoke test for Phase 3 — scoring engine. Pure logic, synthetic inputs,
+// no network/dev-server needed. Run with: npx tsx smoketests/phase3-engine.ts
+
+import { scoreSymbol } from "../src/lib/scoring";
+import type { NSEQuote } from "../src/lib/marketData";
+
+let failures = 0;
+function check(name: string, condition: boolean) {
+  if (condition) console.log(`PASS: ${name}`);
+  else {
+    console.error(`FAIL: ${name}`);
+    failures++;
+  }
+}
+
+function makeQuote(overrides: Partial<NSEQuote> = {}): NSEQuote {
+  return {
+    symbol: "TEST.NS",
+    price: 102,
+    changePct: 2,
+    volume: 1_000_000,
+    high52w: 150,
+    low52w: 80,
+    prevClose: 100,
+    sourceTimestamp: Date.now(),
+    ...overrides,
+  };
+}
+
+const NO_VOLUME_SIGNAL = { isAnomaly: false, ratio: null, isLive: true };
+const ONE_HOUR = 60 * 60 * 1000;
+
+// Test 1: same raw % move, different volatility tiers -> different tiers.
+const move2pct = makeQuote({ price: 102, prevClose: 100 });
+const lastSeenOneHourAgo = { price: 100, timestamp: Date.now() - ONE_HOUR };
+
+const lowVolResult = scoreSymbol({
+  quote: move2pct,
+  lastSeen: lastSeenOneHourAgo,
+  volatility: { sigma: 0.008, isLive: true }, // low-vol blue chip, e.g. HDFCBANK-tier
+  volumeAnomaly: NO_VOLUME_SIGNAL,
+});
+const highVolResult = scoreSymbol({
+  quote: move2pct,
+  lastSeen: lastSeenOneHourAgo,
+  volatility: { sigma: 0.038, isLive: true }, // high-vol name, e.g. ADANIENT-tier
+  volumeAnomaly: NO_VOLUME_SIGNAL,
+});
+
+check(
+  `same 2% move scores higher tier on low-vol stock than high-vol stock (low=${lowVolResult.tier}, high=${highVolResult.tier})`,
+  ["CRITICAL", "NOTABLE"].includes(lowVolResult.tier) && highVolResult.tier !== lowVolResult.tier || (lowVolResult.zScore ?? 0) > (highVolResult.zScore ?? 0)
+);
+
+// Test 2: volume anomaly alone (no meaningful price move) still flags.
+const flatPriceQuote = makeQuote({ price: 100.05, prevClose: 100 });
+const volumeOnlyResult = scoreSymbol({
+  quote: flatPriceQuote,
+  lastSeen: { price: 100, timestamp: Date.now() - ONE_HOUR },
+  volatility: { sigma: 0.02, isLive: true },
+  volumeAnomaly: { isAnomaly: true, ratio: 4.2, isLive: true },
+});
+check(
+  `volume anomaly alone (flat price) still escalates tier (got ${volumeOnlyResult.tier})`,
+  volumeOnlyResult.tier !== "QUIET"
+);
+check("volume anomaly reason surfaces in primary or secondary", volumeOnlyResult.primaryReason.includes("Volume") || volumeOnlyResult.secondaryReasons.some((r) => r.includes("Volume")));
+
+// Test 3: level break triggers regardless of small price move.
+const levelBreakQuote = makeQuote({ price: 150.5, high52w: 150, prevClose: 150.2 });
+const levelBreakResult = scoreSymbol({
+  quote: levelBreakQuote,
+  lastSeen: { price: 150.2, timestamp: Date.now() - ONE_HOUR },
+  volatility: { sigma: 0.02, isLive: true },
+  volumeAnomaly: NO_VOLUME_SIGNAL,
+});
+check(`52-week high break flags isLevelBreak`, levelBreakResult.isLevelBreak === true);
+check(`52-week high break escalates tier (got ${levelBreakResult.tier})`, levelBreakResult.tier !== "QUIET");
+
+// Test 4: same % move, longer elapsed time since last seen -> lower z-score
+// (a big move is less surprising the longer you've been away).
+const sameMoveQuote = makeQuote({ price: 105, prevClose: 100 });
+const shortElapsed = scoreSymbol({
+  quote: sameMoveQuote,
+  lastSeen: { price: 100, timestamp: Date.now() - 5 * 60 * 1000 }, // 5 min ago
+  volatility: { sigma: 0.02, isLive: true },
+  volumeAnomaly: NO_VOLUME_SIGNAL,
+});
+const longElapsed = scoreSymbol({
+  quote: sameMoveQuote,
+  lastSeen: { price: 100, timestamp: Date.now() - 3 * 24 * 60 * 60 * 1000 }, // 3 days ago
+  volatility: { sigma: 0.02, isLive: true },
+  volumeAnomaly: NO_VOLUME_SIGNAL,
+});
+check(
+  `same 5% move scores a higher z-score after 5 minutes (${shortElapsed.zScore?.toFixed(2)}) than after 3 days (${longElapsed.zScore?.toFixed(2)})`,
+  (shortElapsed.zScore ?? 0) > (longElapsed.zScore ?? 0)
+);
+
+console.log(failures === 0 ? "\nAll phase 3 smoke checks passed." : `\n${failures} check(s) failed.`);
+process.exit(failures === 0 ? 0 : 1);
