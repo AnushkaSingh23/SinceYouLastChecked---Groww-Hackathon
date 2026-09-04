@@ -12,6 +12,7 @@ import { NSE_40_UNIVERSE } from "./nseUniverse";
 import { SymbolVolatilityTracker } from "./volatility";
 import { VolumeAnomalyTracker } from "./volumeAnomaly";
 import { scoreSymbol, type AttentionCard, type LastSeen } from "./scoring";
+import { ShockInjector, type ShockOverride } from "./shockInjector";
 
 const POLL_INTERVAL_MS = 20_000;
 
@@ -24,6 +25,7 @@ class MarketFeedStore {
   private listeners = new Set<Listener>();
   private pollHandle: ReturnType<typeof setInterval> | null = null;
   private lastPollAt: number | null = null;
+  private shocks = new ShockInjector();
 
   constructor() {
     for (const s of NSE_40_UNIVERSE) {
@@ -59,12 +61,38 @@ class MarketFeedStore {
     const volumeTracker = this.volumeTrackers.get(symbol);
     if (!quote || !tracker || !volumeTracker) return null;
 
-    return scoreSymbol({
-      quote,
+    const shock = this.shocks.get(symbol);
+    const effectiveQuote = shock?.priceOverridePct !== undefined
+      ? { ...quote, price: quote.price * (1 + shock.priceOverridePct) }
+      : quote;
+    const effectiveVolumeAnomaly = shock?.volumeAnomalyRatio !== undefined
+      ? { isAnomaly: true, ratio: shock.volumeAnomalyRatio, isLive: true }
+      : volumeTracker.getLastResult();
+
+    const card = scoreSymbol({
+      quote: effectiveQuote,
       lastSeen,
       volatility: tracker.getEffectiveVolatility(),
-      volumeAnomaly: volumeTracker.getLastResult(),
+      volumeAnomaly: effectiveVolumeAnomaly,
     });
+
+    if (shock) {
+      card.isSimulated = true;
+      if (shock.headline) card.newsHeadline = shock.headline;
+    }
+    return card;
+  }
+
+  injectShock(symbol: string, override: Omit<ShockOverride, "injectedAt">): void {
+    this.shocks.inject(symbol, override);
+  }
+
+  clearShock(symbol: string): void {
+    this.shocks.clear(symbol);
+  }
+
+  clearAllShocks(): void {
+    this.shocks.clearAll();
   }
 
   subscribe(listener: Listener): () => void {

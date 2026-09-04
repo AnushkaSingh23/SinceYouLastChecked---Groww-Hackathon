@@ -17,6 +17,8 @@ interface AttentionCard {
   isVolumeAnomaly: boolean;
   volatilityIsLive: boolean;
   dataFreshnessSec: number;
+  isSimulated?: boolean;
+  newsHeadline?: string;
 }
 
 interface WatchlistItemData {
@@ -47,6 +49,17 @@ const TIER_STYLES: Record<Tier, string> = {
 };
 
 const TIER_RANK: Record<Tier, number> = { CRITICAL: 2, NOTABLE: 1, QUIET: 0 };
+
+// Dev/demo presets — NSE is only live ~6 hours total across this hackathon's
+// window, so this is how CRITICAL/NOTABLE states get demonstrated on demand
+// rather than waiting for the market to cooperate. See shockInjector.ts.
+const SHOCK_PRESETS = [
+  { priceOverridePct: -0.062, volumeAnomalyRatio: 4.1, headline: "Q2 earnings miss street estimates by 9%" },
+  { priceOverridePct: 0.081, volumeAnomalyRatio: 5.3, headline: "Board approves surprise share buyback" },
+  { priceOverridePct: -0.045, volumeAnomalyRatio: 3.2, headline: "Regulatory probe reported by newswires" },
+  { priceOverridePct: 0.055, volumeAnomalyRatio: 2.8, headline: "Analyst upgrade cites strong Q3 guidance" },
+  { priceOverridePct: 0.01, volumeAnomalyRatio: 6.5, headline: "Unusual volume ahead of scheduled board meeting" },
+];
 
 const TIER_BADGE: Record<Tier, string> = {
   CRITICAL: "bg-red-500 text-white",
@@ -132,7 +145,17 @@ function MarketStatusBanner({ status, lastPollAt }: { status: MarketStatus; last
   );
 }
 
-function Card({ item, onRemove }: { item: WatchlistItemData; onRemove: (symbol: string) => void }) {
+function Card({
+  item,
+  onRemove,
+  onSimulate,
+  onClearSimulation,
+}: {
+  item: WatchlistItemData;
+  onRemove: (symbol: string) => void;
+  onSimulate: (symbol: string) => void;
+  onClearSimulation: (symbol: string) => void;
+}) {
   const c = item.card;
   const tier: Tier = c?.tier ?? "QUIET";
 
@@ -160,16 +183,33 @@ function Card({ item, onRemove }: { item: WatchlistItemData; onRemove: (symbol: 
               {(c.priceChangePct * 100).toFixed(2)}%
             </span>
             {c.zScore !== null && <span className="text-xs text-neutral-500">({c.zScore.toFixed(1)}σ)</span>}
+            {c.isSimulated && (
+              <span className="rounded bg-violet-500/20 px-1.5 py-0.5 text-[10px] font-medium text-violet-300">
+                SIMULATED
+              </span>
+            )}
           </div>
           <p className="mt-2 text-sm text-neutral-300">{c.primaryReason}</p>
+          {c.newsHeadline && <p className="mt-1 text-xs italic text-violet-300">&ldquo;{c.newsHeadline}&rdquo;</p>}
           {c.secondaryReasons.map((r, i) => (
             <p key={i} className="text-xs text-neutral-500">
               {r}
             </p>
           ))}
-          <div className="mt-3 text-xs text-neutral-600">
-            {c.volatilityIsLive ? "live volatility" : "seed volatility (warming up)"} · data{" "}
-            {c.dataFreshnessSec < 60 ? `${c.dataFreshnessSec}s` : `${Math.round(c.dataFreshnessSec / 60)}m`} old
+          <div className="mt-3 flex items-center justify-between text-xs text-neutral-600">
+            <span>
+              {c.volatilityIsLive ? "live volatility" : "seed volatility (warming up)"} · data{" "}
+              {c.dataFreshnessSec < 60 ? `${c.dataFreshnessSec}s` : `${Math.round(c.dataFreshnessSec / 60)}m`} old
+            </span>
+            {c.isSimulated ? (
+              <button onClick={() => onClearSimulation(item.symbol)} className="text-violet-400 hover:text-violet-300">
+                clear simulation
+              </button>
+            ) : (
+              <button onClick={() => onSimulate(item.symbol)} className="text-neutral-500 hover:text-neutral-300">
+                ⚡ simulate event
+              </button>
+            )}
           </div>
         </>
       ) : (
@@ -217,6 +257,21 @@ export default function Home() {
 
   const removeSymbol = async (symbol: string) => {
     await fetch(`/api/watchlist?symbol=${encodeURIComponent(symbol)}`, { method: "DELETE" });
+    refresh();
+  };
+
+  const simulateEvent = async (symbol: string) => {
+    const preset = SHOCK_PRESETS[Math.floor(Math.random() * SHOCK_PRESETS.length)];
+    await fetch("/api/dev/shock", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ symbol, ...preset }),
+    });
+    refresh();
+  };
+
+  const clearSimulation = async (symbol: string) => {
+    await fetch(`/api/dev/shock?symbol=${encodeURIComponent(symbol)}`, { method: "DELETE" });
     refresh();
   };
 
@@ -271,6 +326,18 @@ export default function Home() {
         </button>
       )}
 
+      {data?.items.some((i) => i.card?.isSimulated) && (
+        <button
+          onClick={async () => {
+            await fetch("/api/dev/shock", { method: "DELETE" });
+            refresh();
+          }}
+          className="mt-2 w-full rounded border border-violet-800 py-1.5 text-xs text-violet-300 hover:bg-violet-950/40"
+        >
+          Clear all simulated events
+        </button>
+      )}
+
       {data && data.items.length > 0 && (
         <p className="mt-4 text-sm text-neutral-400">
           {needsAttention.length === 0
@@ -282,7 +349,7 @@ export default function Home() {
       {needsAttention.length > 0 && (
         <div className="mt-3 space-y-3">
           {needsAttention.map((item) => (
-            <Card key={item.symbol} item={item} onRemove={removeSymbol} />
+            <Card key={item.symbol} item={item} onRemove={removeSymbol} onSimulate={simulateEvent} onClearSimulation={clearSimulation} />
           ))}
         </div>
       )}
@@ -294,7 +361,7 @@ export default function Home() {
           </p>
           <div className="space-y-2">
             {unchanged.map((item) => (
-              <Card key={item.symbol} item={item} onRemove={removeSymbol} />
+              <Card key={item.symbol} item={item} onRemove={removeSymbol} onSimulate={simulateEvent} onClearSimulation={clearSimulation} />
             ))}
           </div>
         </div>

@@ -43,6 +43,9 @@ export interface AttentionCard {
   isVolumeAnomaly: boolean;
   volatilityIsLive: boolean;
   dataFreshnessSec: number;
+  /** Set by marketFeedStore when a dev shock override is active for this symbol — scoring.ts itself doesn't know about shocks. */
+  isSimulated?: boolean;
+  newsHeadline?: string;
 }
 
 export function scoreSymbol(params: {
