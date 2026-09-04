@@ -10,6 +10,7 @@ import { NSE_40_UNIVERSE } from "@/lib/nseUniverse";
 // having to notice it). Type-only import, erased at compile time — no
 // runtime cost, and scoring.ts has no server-only dependencies.
 import type { Tier, AttentionCard } from "@/lib/scoring";
+import type { LongTermTrend } from "@/lib/longTermTrend";
 
 interface WatchlistItemData {
   symbol: string;
@@ -17,6 +18,7 @@ interface WatchlistItemData {
   addedAt: string;
   lastSeenAt: string | null;
   card: AttentionCard | null;
+  trend: LongTermTrend | null;
 }
 
 interface MarketStatus {
@@ -115,6 +117,49 @@ function IdentityGate({ onIdentify }: { onIdentify: (name: string) => Promise<un
   );
 }
 
+const TREND_LABEL_STYLE: Record<LongTermTrend["label"], string> = {
+  Upward: "text-emerald-400",
+  Downward: "text-red-400",
+  Mixed: "text-neutral-400",
+};
+
+function TrendStat({ label, pct }: { label: string; pct: number | null }) {
+  return (
+    <div className="flex flex-col items-center">
+      <span className="text-neutral-600">{label}</span>
+      {pct === null ? (
+        <span className="text-neutral-700">—</span>
+      ) : (
+        <span className={pct >= 0 ? "text-emerald-400" : "text-red-400"}>
+          {pct >= 0 ? "+" : ""}
+          {(pct * 100).toFixed(1)}%
+        </span>
+      )}
+    </div>
+  );
+}
+
+// Secondary to "Since You Last Checked" by design — smaller text, muted
+// heading, placed below the primary content and the demo controls, not
+// competing with the tier badge/color for attention.
+function TrendSection({ trend }: { trend: LongTermTrend | null }) {
+  if (!trend) return null;
+  return (
+    <div className="mt-3 border-t border-neutral-800 pt-3">
+      <div className="mb-1.5 flex items-center justify-between">
+        <span className="text-[11px] uppercase tracking-wide text-neutral-600">Longer-Term Trend</span>
+        <span className={`text-[11px] font-medium ${TREND_LABEL_STYLE[trend.label]}`}>{trend.label}</span>
+      </div>
+      <div className="flex justify-between text-xs">
+        <TrendStat label="1M" pct={trend.oneMonthPct} />
+        <TrendStat label="3M" pct={trend.threeMonthPct} />
+        <TrendStat label="6M" pct={trend.sixMonthPct} />
+        <TrendStat label="1Y" pct={trend.oneYearPct} />
+      </div>
+    </div>
+  );
+}
+
 function MarketStatusBanner({ status, lastPollAt }: { status: MarketStatus; lastPollAt: number | null }) {
   return (
     <div className="flex items-center justify-between rounded border border-neutral-800 bg-neutral-900/60 px-4 py-2 text-sm">
@@ -167,11 +212,9 @@ function Card({
               {c.priceChangePct >= 0 ? "+" : ""}
               {(c.priceChangePct * 100).toFixed(2)}%
             </span>
-            {c.zScore !== null && (
-              <span className="text-xs text-neutral-500">
-                ({c.zScore.toFixed(1)}σ{c.zScoreClamped ? "+" : ""})
-              </span>
-            )}
+            <span className="text-xs text-neutral-500">
+              ({c.priceChangeAbs >= 0 ? "+" : "-"}₹{Math.abs(c.priceChangeAbs).toFixed(2)})
+            </span>
             {c.isSimulated && (
               <span className="rounded bg-violet-500/20 px-1.5 py-0.5 text-[10px] font-medium text-violet-300">
                 SIMULATED
@@ -204,6 +247,7 @@ function Card({
               </button>
             )}
           </div>
+          <TrendSection trend={item.trend} />
         </>
       ) : (
         <p className="mt-3 text-sm text-neutral-500">Waiting for first live quote…</p>
@@ -216,6 +260,7 @@ export default function Home() {
   const { handle, identify } = useIdentity();
   const [data, setData] = useState<WatchlistResponse | null>(null);
   const [addSymbol, setAddSymbol] = useState("");
+  const [stockSearch, setStockSearch] = useState("");
 
   const refresh = useCallback(() => {
     fetch("/api/watchlist")
@@ -242,6 +287,10 @@ export default function Home() {
 
   const watchedSymbols = new Set(data?.items.map((i) => i.symbol));
   const available = NSE_40_UNIVERSE.filter((s) => !watchedSymbols.has(s.symbol));
+  const query = stockSearch.trim().toLowerCase();
+  const filteredAvailable = query
+    ? available.filter((s) => s.name.toLowerCase().includes(query) || s.symbol.toLowerCase().includes(query))
+    : available;
 
   // "Don't make me scan everything" — sort by what deserves attention first,
   // and separate the unchanged so it can be visually demoted, not just
@@ -284,14 +333,27 @@ export default function Home() {
 
       {data && <MarketStatusBanner status={data.marketStatus} lastPollAt={data.lastPollAt} />}
 
-      <div className="mt-4 flex gap-2">
+      <input
+        type="text"
+        className="mt-4 w-full rounded border border-neutral-700 bg-neutral-900 px-3 py-2 text-sm outline-none focus:border-neutral-400"
+        placeholder="Search stocks by name or symbol…"
+        value={stockSearch}
+        onChange={(e) => {
+          setStockSearch(e.target.value);
+          // Reset the selection when the search narrows the option list, so
+          // "Add" never stays enabled for a symbol that's no longer visible.
+          setAddSymbol("");
+        }}
+      />
+
+      <div className="mt-2 flex gap-2">
         <select
           className="flex-1 rounded border border-neutral-700 bg-neutral-900 px-3 py-2 text-sm"
           value={addSymbol}
           onChange={(e) => setAddSymbol(e.target.value)}
         >
-          <option value="">Add a stock…</option>
-          {available.map((s) => (
+          <option value="">{filteredAvailable.length > 0 ? "Add a stock…" : "No matches"}</option>
+          {filteredAvailable.map((s) => (
             <option key={s.symbol} value={s.symbol}>
               {s.name} ({s.symbol})
             </option>
@@ -306,6 +368,7 @@ export default function Home() {
               body: JSON.stringify({ symbol: addSymbol }),
             });
             setAddSymbol("");
+            setStockSearch("");
             refresh();
           }}
           className="rounded bg-neutral-100 px-4 py-2 text-sm font-medium text-black disabled:opacity-50"

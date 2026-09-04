@@ -4,6 +4,7 @@ import { prisma } from "@/lib/prisma";
 import { marketFeedStore } from "@/lib/marketFeedStore";
 import { getNSEMarketStatus } from "@/lib/marketHours";
 import { NSE_40_UNIVERSE } from "@/lib/nseUniverse";
+import { getLongTermTrend } from "@/lib/longTermTrend";
 
 export async function GET() {
   const userId = await getCurrentUserId();
@@ -17,17 +18,23 @@ export async function GET() {
     orderBy: { addedAt: "asc" },
   });
 
-  const cards = items.map((item) => {
-    const lastSeen = item.lastSeen ? { price: item.lastSeen.price, timestamp: item.lastSeen.timestamp.getTime() } : null;
-    const meta = NSE_40_UNIVERSE.find((s) => s.symbol === item.symbol);
-    return {
-      symbol: item.symbol,
-      name: meta?.name ?? item.symbol,
-      addedAt: item.addedAt,
-      lastSeenAt: item.lastSeen?.timestamp ?? null,
-      card: marketFeedStore.getAttentionCard(item.symbol, lastSeen),
-    };
-  });
+  // Long-term trend is cached for a day and fetched independently of the
+  // live poll loop — a secondary feature, kept off the primary "since you
+  // last checked" hot path entirely (see longTermTrend.ts).
+  const cards = await Promise.all(
+    items.map(async (item) => {
+      const lastSeen = item.lastSeen ? { price: item.lastSeen.price, timestamp: item.lastSeen.timestamp.getTime() } : null;
+      const meta = NSE_40_UNIVERSE.find((s) => s.symbol === item.symbol);
+      return {
+        symbol: item.symbol,
+        name: meta?.name ?? item.symbol,
+        addedAt: item.addedAt,
+        lastSeenAt: item.lastSeen?.timestamp ?? null,
+        card: marketFeedStore.getAttentionCard(item.symbol, lastSeen),
+        trend: await getLongTermTrend(item.symbol),
+      };
+    })
+  );
 
   return NextResponse.json({
     marketStatus: getNSEMarketStatus(),

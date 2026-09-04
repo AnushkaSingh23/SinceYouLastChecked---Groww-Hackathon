@@ -53,6 +53,8 @@ export interface AttentionCard {
   currentPrice: number;
   /** % change since last-seen price (or since previous close if never seen). */
   priceChangePct: number;
+  /** Signed ₹ change since the same baseline as priceChangePct. */
+  priceChangeAbs: number;
   zScore: number | null;
   /** True if zScore hit the display ceiling (MAX_DISPLAY_Z) — the real move was even larger. */
   zScoreClamped: boolean;
@@ -96,6 +98,7 @@ export function scoreSymbol(params: {
   // as secondary context, just without driving the tier.
   if (!lastSeen) {
     const priceChangePct = quote.prevClose > 0 ? (quote.price - quote.prevClose) / quote.prevClose : 0;
+    const priceChangeAbs = quote.prevClose > 0 ? quote.price - quote.prevClose : 0;
     const secondaryReasons: string[] = [];
     if (isLevelBreak) {
       const level = brokeHigh ? quote.high52w! : quote.low52w!;
@@ -108,6 +111,7 @@ export function scoreSymbol(params: {
       symbol: quote.symbol,
       currentPrice: quote.price,
       priceChangePct,
+      priceChangeAbs,
       zScore: null,
       zScoreClamped: false,
       tier: "NEW",
@@ -126,6 +130,7 @@ export function scoreSymbol(params: {
   // silently showing the real, unshocked change next to a simulated price
   // — that inconsistency was a real bug caught in review, see ERRORS.md.
   const priceChangePct = (quote.price - lastSeen.price) / lastSeen.price;
+  const priceChangeAbs = quote.price - lastSeen.price;
 
   // Tier decisions always use the RAW z-score, never the display-clamped
   // one — capping is a display concern only. (A previous version clamped
@@ -187,6 +192,7 @@ export function scoreSymbol(params: {
     symbol: quote.symbol,
     currentPrice: quote.price,
     priceChangePct,
+    priceChangeAbs,
     zScore,
     zScoreClamped,
     tier,
