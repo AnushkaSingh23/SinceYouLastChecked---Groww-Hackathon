@@ -20,6 +20,17 @@ const escalate = (t: Tier): Tier => (t === "QUIET" ? "NOTABLE" : "CRITICAL");
 const Z_CRITICAL = 3;
 const Z_NOTABLE = 1.5;
 
+// Display/storage ceiling. The raw math is honest — a large real move over
+// a very short elapsed window (e.g. the dev shock injector fired seconds
+// after "mark as seen") genuinely computes as a huge sigma value under the
+// sqrt(time) model, that's not a division-by-near-zero bug (sigma itself is
+// fine; see ERRORS.md). But nothing past ~6σ is more informative than
+// "extremely unusual" to a human reading the card, and an uncapped number
+// like "89.8σ" reads as broken math to anyone reviewing it, not as a
+// meaningful signal. Six sigma is also a recognizable, standard threshold
+// for "practically impossible under normal variation."
+const MAX_DISPLAY_Z = 6;
+
 // Floor on elapsed time used for the sqrt(time) scaling, so a near-instant
 // re-check doesn't divide by ~0 and produce an absurd z-score. One poll
 // interval's worth of trading-day-fraction is a reasonable minimum.
@@ -36,6 +47,8 @@ export interface AttentionCard {
   /** % change since last-seen price (or since previous close if never seen). */
   priceChangePct: number;
   zScore: number | null;
+  /** True if zScore hit the display ceiling (MAX_DISPLAY_Z) — the real move was even larger. */
+  zScoreClamped: boolean;
   tier: Tier;
   primaryReason: string;
   secondaryReasons: string[];
@@ -71,12 +84,20 @@ export function scoreSymbol(params: {
     : quote.changePct / 100;
 
   let zScore: number | null = null;
+  let zScoreClamped = false;
   if (lastSeen) {
     const elapsedMs = Math.max(now - lastSeen.timestamp, 0);
     const elapsedTradingFraction = Math.max(elapsedMs / TRADING_DAY_MS, MIN_ELAPSED_FRACTION);
     const expectedMoveForElapsed = volatility.sigma * Math.sqrt(elapsedTradingFraction);
-    zScore = expectedMoveForElapsed > 0 ? Math.abs(priceChangePct) / expectedMoveForElapsed : null;
+    const rawZ = expectedMoveForElapsed > 0 ? Math.abs(priceChangePct) / expectedMoveForElapsed : null;
+    if (rawZ !== null && rawZ > MAX_DISPLAY_Z) {
+      zScore = MAX_DISPLAY_Z;
+      zScoreClamped = true;
+    } else {
+      zScore = rawZ;
+    }
   }
+  const zScoreLabel = (z: number) => `${z.toFixed(1)}σ${zScoreClamped ? "+" : ""}`;
 
   const secondaryReasons: string[] = [];
   let tier: Tier = "QUIET";
@@ -89,11 +110,11 @@ export function scoreSymbol(params: {
   if (zScore !== null) {
     if (zScore >= Z_CRITICAL) {
       tier = maxTier(tier, "CRITICAL");
-      primaryReason = `Price moved ${(priceChangePct * 100).toFixed(1)}% — a ${zScore.toFixed(1)}σ move, unusual for this stock.`;
+      primaryReason = `Price moved ${(priceChangePct * 100).toFixed(1)}% — a ${zScoreLabel(zScore)} move, unusual for this stock.`;
       signalCount++;
     } else if (zScore >= Z_NOTABLE) {
       tier = maxTier(tier, "NOTABLE");
-      primaryReason = `Price moved ${(priceChangePct * 100).toFixed(1)}% (${zScore.toFixed(1)}σ for this stock).`;
+      primaryReason = `Price moved ${(priceChangePct * 100).toFixed(1)}% (${zScoreLabel(zScore)} for this stock).`;
       signalCount++;
     }
   }
@@ -125,6 +146,7 @@ export function scoreSymbol(params: {
     currentPrice: quote.price,
     priceChangePct,
     zScore,
+    zScoreClamped,
     tier,
     primaryReason,
     secondaryReasons,

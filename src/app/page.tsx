@@ -10,6 +10,7 @@ interface AttentionCard {
   currentPrice: number;
   priceChangePct: number;
   zScore: number | null;
+  zScoreClamped: boolean;
   tier: Tier;
   primaryReason: string;
   secondaryReasons: string[];
@@ -182,7 +183,11 @@ function Card({
               {c.priceChangePct >= 0 ? "+" : ""}
               {(c.priceChangePct * 100).toFixed(2)}%
             </span>
-            {c.zScore !== null && <span className="text-xs text-neutral-500">({c.zScore.toFixed(1)}σ)</span>}
+            {c.zScore !== null && (
+              <span className="text-xs text-neutral-500">
+                ({c.zScore.toFixed(1)}σ{c.zScoreClamped ? "+" : ""})
+              </span>
+            )}
             {c.isSimulated && (
               <span className="rounded bg-violet-500/20 px-1.5 py-0.5 text-[10px] font-medium text-violet-300">
                 SIMULATED

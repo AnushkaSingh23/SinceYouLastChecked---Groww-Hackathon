@@ -111,5 +111,28 @@ const freshAddResult = scoreSymbol({
 check(`never-seen-before symbol has no z-score (got ${freshAddResult.zScore})`, freshAddResult.zScore === null);
 check(`never-seen-before symbol is QUIET, not CRITICAL (got ${freshAddResult.tier})`, freshAddResult.tier === "QUIET");
 
+// Test 6: a real move over a near-instant elapsed time (e.g. the dev shock
+// injector fired seconds after "mark as seen") must never display an
+// absurd z-score. This is a real bug that shipped: a -6.2% shock 1 second
+// after mark-seen displayed as "89.8σ" / "130.5σ" — technically what the
+// sqrt(time) math produces, but reads as broken to anyone looking at it.
+// See ERRORS.md.
+const nearInstantQuote = makeQuote({ price: 993.06, prevClose: 1059 });
+const nearInstantResult = scoreSymbol({
+  quote: nearInstantQuote,
+  lastSeen: { price: 1059, timestamp: Date.now() - 1000 }, // 1 second ago
+  volatility: { sigma: 0.027, isLive: true }, // BAJFINANCE.NS-tier sigma
+  volumeAnomaly: { isAnomaly: true, ratio: 4.1, isLive: true },
+});
+check(
+  `a large move 1 second after mark-seen never displays an absurd z-score (got ${nearInstantResult.zScore})`,
+  (nearInstantResult.zScore ?? 0) <= 6
+);
+check("that z-score is flagged as clamped, not silently truncated", nearInstantResult.zScoreClamped === true);
+check(
+  `the reason string shows the clamp honestly, not a fake precise huge number`,
+  nearInstantResult.primaryReason.includes("6.0σ+")
+);
+
 console.log(failures === 0 ? "\nAll phase 3 smoke checks passed." : `\n${failures} check(s) failed.`);
 process.exit(failures === 0 ? 0 : 1);
