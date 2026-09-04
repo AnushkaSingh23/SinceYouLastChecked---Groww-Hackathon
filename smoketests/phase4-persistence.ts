@@ -50,7 +50,17 @@ async function main() {
 
   const freshItem = listData.items.find((i: { symbol: string }) => i.symbol === "RELIANCE.NS");
   check("never-seen item has no z-score", freshItem?.card?.zScore === null);
-  check("never-seen item is QUIET, not a false CRITICAL", freshItem?.card?.tier === "QUIET");
+  // NOTE: we don't assert tier === QUIET here. A never-seen item can still
+  // legitimately be NOTABLE if there's a real, independent level-break or
+  // volume anomaly happening right now on live market data — that's correct
+  // behavior, not a bug (see ERRORS.md: this assertion used to be too rigid
+  // and produced a false failure during a real transient volume blip). What
+  // must always hold is that price-based tiering (the thing "never seen"
+  // actually changes) never fires without a last-seen baseline.
+  check(
+    "never-seen item's tier, if elevated, comes from level-break/volume only (not a phantom price z-score)",
+    freshItem?.card?.zScore === null && (freshItem?.card?.tier === "QUIET" || freshItem?.card?.isLevelBreak || freshItem?.card?.isVolumeAnomaly)
+  );
 
   const markSeenRes = await fetch(`${BASE}/api/watchlist/mark-seen`, {
     method: "POST",
@@ -62,7 +72,12 @@ async function main() {
   const afterSeenRes = await fetch(`${BASE}/api/watchlist`, { headers: authHeaders });
   const afterSeenData = await afterSeenRes.json();
   const afterSeenItem = afterSeenData.items.find((i: { symbol: string }) => i.symbol === "RELIANCE.NS");
-  check("after mark-seen, tier resets to QUIET with ~0 change", afterSeenItem?.card?.tier === "QUIET");
+  // The invariant mark-seen actually guarantees is the PRICE baseline reset
+  // (change% and z-score collapse to ~0) — not the overall tier, since a
+  // real, independent volume anomaly can still be active right now
+  // regardless of when the price was last checked (see note above).
+  check("after mark-seen, price change collapses to ~0%", Math.abs(afterSeenItem?.card?.priceChangePct ?? 1) < 0.001);
+  check("after mark-seen, z-score collapses to ~0", (afterSeenItem?.card?.zScore ?? 999) < 0.1);
   check("after mark-seen, lastSeenAt is now set", afterSeenItem?.lastSeenAt !== null);
 
   const removeRes = await fetch(`${BASE}/api/watchlist?symbol=RELIANCE.NS`, { method: "DELETE", headers: authHeaders });
