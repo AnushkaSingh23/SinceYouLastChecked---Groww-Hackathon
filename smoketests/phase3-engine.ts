@@ -27,7 +27,7 @@ function makeQuote(overrides: Partial<NSEQuote> = {}): NSEQuote {
   };
 }
 
-const NO_VOLUME_SIGNAL = { isAnomaly: false, ratio: null, isLive: true };
+const NO_VOLUME_SIGNAL = { isAnomaly: false, ratio: null, ratioClamped: false, isLive: true };
 const ONE_HOUR = 60 * 60 * 1000;
 
 // Test 1: same raw % move, different volatility tiers -> different tiers.
@@ -58,7 +58,7 @@ const volumeOnlyResult = scoreSymbol({
   quote: flatPriceQuote,
   lastSeen: { price: 100, timestamp: Date.now() - ONE_HOUR },
   volatility: { sigma: 0.02, isLive: true },
-  volumeAnomaly: { isAnomaly: true, ratio: 4.2, isLive: true },
+  volumeAnomaly: { isAnomaly: true, ratio: 4.2, ratioClamped: false, isLive: true },
 });
 check(
   `volume anomaly alone (flat price) still escalates tier (got ${volumeOnlyResult.tier})`,
@@ -109,7 +109,31 @@ const freshAddResult = scoreSymbol({
   volumeAnomaly: NO_VOLUME_SIGNAL,
 });
 check(`never-seen-before symbol has no z-score (got ${freshAddResult.zScore})`, freshAddResult.zScore === null);
-check(`never-seen-before symbol is QUIET, not CRITICAL (got ${freshAddResult.tier})`, freshAddResult.tier === "QUIET");
+check(`never-seen-before symbol is NEW, not CRITICAL (got ${freshAddResult.tier})`, freshAddResult.tier === "NEW");
+check(`NEW tier has the baseline-created message`, freshAddResult.primaryReason === "New to your watchlist — baseline created.");
+
+// Test 5b: NEW must hold even when a never-seen symbol has BOTH a real
+// level-break AND a real volume anomaly at the same time — this is the
+// exact scenario a judge could hit: add a stock that happens to be at its
+// 52-week high with unusual volume right now, and the two real, independent
+// signals used to combine via the same 2-signal escalation rule that
+// applies once there's a baseline, producing a false CRITICAL on a stock
+// with zero "since you checked" history. NEW must never escalate.
+const activeNewStockQuote = makeQuote({ price: 150, prevClose: 148, high52w: 150, low52w: 80 });
+const activeNewStockResult = scoreSymbol({
+  quote: activeNewStockQuote,
+  lastSeen: null,
+  volatility: { sigma: 0.02, isLive: true },
+  volumeAnomaly: { isAnomaly: true, ratio: 5.0, ratioClamped: false, isLive: true },
+});
+check(
+  `a never-seen stock at its 52-week high WITH a volume spike is still NEW, not escalated (got ${activeNewStockResult.tier})`,
+  activeNewStockResult.tier === "NEW"
+);
+check(
+  "the real level-break and volume facts still surface as context, just not as an alarming tier",
+  activeNewStockResult.secondaryReasons.length === 2
+);
 
 // Test 6: a real move over a near-instant elapsed time (e.g. the dev shock
 // injector fired seconds after "mark as seen") must never display an
@@ -122,7 +146,7 @@ const nearInstantResult = scoreSymbol({
   quote: nearInstantQuote,
   lastSeen: { price: 1059, timestamp: Date.now() - 1000 }, // 1 second ago
   volatility: { sigma: 0.027, isLive: true }, // BAJFINANCE.NS-tier sigma
-  volumeAnomaly: { isAnomaly: true, ratio: 4.1, isLive: true },
+  volumeAnomaly: { isAnomaly: true, ratio: 4.1, ratioClamped: false, isLive: true },
 });
 check(
   `a large move 1 second after mark-seen never displays an absurd z-score (got ${nearInstantResult.zScore})`,
@@ -133,6 +157,39 @@ check(
   `the reason string shows the clamp honestly, not a fake precise huge number`,
   nearInstantResult.primaryReason.includes("6.0σ+")
 );
+
+// Test 7: a shocked "never seen before" card must show a price change that
+// actually matches the shocked price, not the real day's unshocked change.
+// This is a real bug caught in review: the shock overlay only rewrote
+// `price`, so a card could show a shocked (e.g. -6%) currentPrice right
+// next to a green "+1.9%" badge computed from the real, untouched day
+// change — exactly the "reads as broken" failure mode. Fixed by deriving
+// priceChangePct from price vs. prevClose consistently in both branches,
+// so an overridden price is automatically reflected. See ERRORS.md.
+const shockedNeverSeenQuote = makeQuote({ price: 1220, prevClose: 1300, changePct: 1.9, high52w: 1600, low52w: 1100 });
+const shockedNeverSeenResult = scoreSymbol({
+  quote: shockedNeverSeenQuote,
+  lastSeen: null,
+  volatility: { sigma: 0.016, isLive: false },
+  volumeAnomaly: NO_VOLUME_SIGNAL,
+});
+check(
+  `shocked never-seen card's priceChangePct reflects the shocked price, not the stale real changePct (got ${(shockedNeverSeenResult.priceChangePct * 100).toFixed(2)}%)`,
+  shockedNeverSeenResult.priceChangePct < 0
+);
+
+// Test 8: a symbol with missing 52-week bounds (Yahoo omits the field) must
+// never be treated as having crossed a level it doesn't actually know.
+// Previously high52w/low52w defaulted to the current price, which made
+// `price >= high52w` trivially true every single poll. See ERRORS.md.
+const missingBoundsQuote = makeQuote({ price: 500, prevClose: 495, high52w: null, low52w: null });
+const missingBoundsResult = scoreSymbol({
+  quote: missingBoundsQuote,
+  lastSeen: { price: 495, timestamp: Date.now() - ONE_HOUR },
+  volatility: { sigma: 0.02, isLive: true },
+  volumeAnomaly: NO_VOLUME_SIGNAL,
+});
+check("missing 52-week bounds never register as a level break", missingBoundsResult.isLevelBreak === false);
 
 console.log(failures === 0 ? "\nAll phase 3 smoke checks passed." : `\n${failures} check(s) failed.`);
 process.exit(failures === 0 ? 0 : 1);

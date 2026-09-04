@@ -90,6 +90,34 @@ async function main() {
   );
 
   await fetch(`${BASE}/api/dev/shock`, { method: "DELETE" });
+
+  // A simulated volume ratio below the app's own real-data threshold
+  // (2.5x) must not be classified as an anomaly — found in review: the
+  // shock path used to unconditionally mark any provided ratio as
+  // `isAnomaly: true`, even 1.2x, contradicting the app's own definition.
+  await fetch(`${BASE}/api/dev/shock`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ symbol: "SUZLON.NS", volumeAnomalyRatio: 1.2 }),
+  });
+  const belowThresholdRes = await fetch(`${BASE}/api/watchlist`, { headers: authHeaders });
+  const belowThresholdData = await belowThresholdRes.json();
+  const belowThresholdItem = belowThresholdData.items.find((i: { symbol: string }) => i.symbol === "SUZLON.NS");
+  check(
+    "a simulated 1.2x volume ratio (below the 2.5x threshold) is not classified as an anomaly",
+    belowThresholdItem?.card?.isVolumeAnomaly === false
+  );
+
+  // Reject a price override that would make the price zero or negative —
+  // found in review: -1.5 (-150%) produced a currentPrice of -1156.20.
+  const negativePriceRes = await fetch(`${BASE}/api/dev/shock`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ symbol: "SUZLON.NS", priceOverridePct: -1.5 }),
+  });
+  check("a priceOverridePct that would make price negative is rejected", negativePriceRes.status === 400);
+
+  await fetch(`${BASE}/api/dev/shock`, { method: "DELETE" });
   await fetch(`${BASE}/api/watchlist?symbol=SUZLON.NS`, { method: "DELETE", headers: authHeaders });
 
   console.log(failures === 0 ? "\nAll phase 5 smoke checks passed." : `\n${failures} check(s) failed.`);

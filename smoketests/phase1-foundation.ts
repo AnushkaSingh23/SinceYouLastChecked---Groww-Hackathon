@@ -52,4 +52,7 @@ async function main() {
   process.exit(failures === 0 ? 0 : 1);
 }
 
-main();
+main().catch((err) => {
+  console.error("Smoke test crashed unexpectedly:", err);
+  process.exit(1);
+});

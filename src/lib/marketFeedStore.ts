@@ -10,9 +10,10 @@
 import { fetchNSEUniverseQuotes, type NSEQuote } from "./marketData";
 import { NSE_40_UNIVERSE } from "./nseUniverse";
 import { SymbolVolatilityTracker } from "./volatility";
-import { VolumeAnomalyTracker } from "./volumeAnomaly";
+import { VolumeAnomalyTracker, ANOMALY_RATIO_THRESHOLD } from "./volumeAnomaly";
 import { scoreSymbol, type AttentionCard, type LastSeen } from "./scoring";
 import { ShockInjector, type ShockOverride } from "./shockInjector";
+import { getNSEMarketStatus } from "./marketHours";
 
 const POLL_INTERVAL_MS = 20_000;
 
@@ -66,7 +67,15 @@ class MarketFeedStore {
       ? { ...quote, price: quote.price * (1 + shock.priceOverridePct) }
       : quote;
     const effectiveVolumeAnomaly = shock?.volumeAnomalyRatio !== undefined
-      ? { isAnomaly: true, ratio: shock.volumeAnomalyRatio, isLive: true }
+      ? {
+          // Classify a simulated ratio the same way a real one would be —
+          // an injected 1.2x shouldn't be called "an anomaly" when the
+          // app's own definition requires >= 2.5x for real data.
+          isAnomaly: shock.volumeAnomalyRatio >= ANOMALY_RATIO_THRESHOLD,
+          ratio: shock.volumeAnomalyRatio,
+          ratioClamped: false,
+          isLive: true,
+        }
       : volumeTracker.getLastResult();
 
     const card = scoreSymbol({
@@ -102,15 +111,40 @@ class MarketFeedStore {
 
   private async poll() {
     const fresh = await fetchNSEUniverseQuotes();
+    // Only feed the volatility/volume trackers while the market is
+    // actually open. This process is designed to survive across this
+    // hackathon's real multi-day gap between trading sessions (Friday
+    // afternoon, then Monday morning — see marketHours.ts) rather than
+    // being restarted each time. Feeding near-zero deltas/ticks from a
+    // closed market into the rolling baselines would deflate them over
+    // the weekend, producing a spurious spike the moment real trading
+    // resumes. The quote cache itself still refreshes regardless (prices
+    // don't change while closed anyway, and staleness display should
+    // stay accurate either way).
+    const marketOpen = getNSEMarketStatus().isOpen;
     for (const q of fresh) {
       this.quotes.set(q.symbol, q);
-      this.trackers.get(q.symbol)?.addTick(q.price, q.sourceTimestamp);
-      this.volumeTrackers.get(q.symbol)?.addReading(q.volume);
+      if (marketOpen) {
+        this.trackers.get(q.symbol)?.addTick(q.price, q.sourceTimestamp);
+        this.volumeTrackers.get(q.symbol)?.addReading(q.volume);
+      }
     }
     this.lastPollAt = Date.now();
 
     const snapshot = this.getSnapshot();
-    for (const listener of this.listeners) listener(snapshot);
+    for (const listener of this.listeners) {
+      // One dead/erroring SSE listener (client disconnected but the abort
+      // event hasn't fired yet, so it's still in the set) must not stop
+      // delivery to every other listener registered after it, and must
+      // not become an unhandled rejection from the fire-and-forget
+      // `void this.poll()` callers below.
+      try {
+        listener(snapshot);
+      } catch {
+        // Swallow — a broken listener is a client-connection problem, not
+        // a reason to break this poll cycle for everyone else.
+      }
+    }
   }
 
   ensureStarted() {

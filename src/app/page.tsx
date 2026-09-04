@@ -2,25 +2,14 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { NSE_40_UNIVERSE } from "@/lib/nseUniverse";
-
-type Tier = "CRITICAL" | "NOTABLE" | "QUIET";
-
-interface AttentionCard {
-  symbol: string;
-  currentPrice: number;
-  priceChangePct: number;
-  zScore: number | null;
-  zScoreClamped: boolean;
-  tier: Tier;
-  primaryReason: string;
-  secondaryReasons: string[];
-  isLevelBreak: boolean;
-  isVolumeAnomaly: boolean;
-  volatilityIsLive: boolean;
-  dataFreshnessSec: number;
-  isSimulated?: boolean;
-  newsHeadline?: string;
-}
+// Import the card shape from where it's actually defined instead of
+// hand-duplicating it here — a hand-copied interface already drifted once
+// (this file was missing `zScoreClamped` until it was added by hand at the
+// same time as scoring.ts, a near-miss that a type-only import removes as a
+// whole category of risk: the compiler catches drift instead of a human
+// having to notice it). Type-only import, erased at compile time — no
+// runtime cost, and scoring.ts has no server-only dependencies.
+import type { Tier, AttentionCard } from "@/lib/scoring";
 
 interface WatchlistItemData {
   symbol: string;
@@ -43,13 +32,14 @@ interface WatchlistResponse {
   items: WatchlistItemData[];
 }
 
-const TIER_STYLES: Record<Tier, string> = {
-  CRITICAL: "border-red-500/60 bg-red-500/10",
-  NOTABLE: "border-amber-500/60 bg-amber-500/10",
-  QUIET: "border-neutral-800 bg-neutral-900/20 opacity-70",
+// One config per tier instead of two separate Records that have to be kept
+// in sync by hand (they'd drifted in key order already — see review notes).
+const TIER_CONFIG: Record<Tier, { card: string; badge: string; rank: number }> = {
+  CRITICAL: { card: "border-red-500/60 bg-red-500/10", badge: "bg-red-500 text-white", rank: 2 },
+  NOTABLE: { card: "border-amber-500/60 bg-amber-500/10", badge: "bg-amber-500 text-black", rank: 1 },
+  NEW: { card: "border-sky-700/60 bg-sky-500/10", badge: "bg-sky-600 text-white", rank: 0 },
+  QUIET: { card: "border-neutral-800 bg-neutral-900/20 opacity-70", badge: "bg-neutral-700 text-neutral-200", rank: 0 },
 };
-
-const TIER_RANK: Record<Tier, number> = { CRITICAL: 2, NOTABLE: 1, QUIET: 0 };
 
 // Dev/demo presets — NSE is only live ~6 hours total across this hackathon's
 // window, so this is how CRITICAL/NOTABLE states get demonstrated on demand
@@ -61,12 +51,6 @@ const SHOCK_PRESETS = [
   { priceOverridePct: 0.055, volumeAnomalyRatio: 2.8, headline: "Analyst upgrade cites strong Q3 guidance" },
   { priceOverridePct: 0.01, volumeAnomalyRatio: 6.5, headline: "Unusual volume ahead of scheduled board meeting" },
 ];
-
-const TIER_BADGE: Record<Tier, string> = {
-  CRITICAL: "bg-red-500 text-white",
-  NOTABLE: "bg-amber-500 text-black",
-  QUIET: "bg-neutral-700 text-neutral-200",
-};
 
 function useIdentity() {
   const [handle, setHandle] = useState<string | null | "loading">("loading");
@@ -161,14 +145,14 @@ function Card({
   const tier: Tier = c?.tier ?? "QUIET";
 
   return (
-    <div className={`rounded-lg border p-4 ${TIER_STYLES[tier]}`}>
+    <div className={`rounded-lg border p-4 ${TIER_CONFIG[tier].card}`}>
       <div className="flex items-start justify-between gap-2">
         <div>
           <div className="font-medium">{item.name}</div>
           <div className="text-xs text-neutral-500">{item.symbol}</div>
         </div>
         <div className="flex items-center gap-2">
-          <span className={`rounded px-2 py-0.5 text-xs font-semibold ${TIER_BADGE[tier]}`}>{tier}</span>
+          <span className={`rounded px-2 py-0.5 text-xs font-semibold ${TIER_CONFIG[tier].badge}`}>{tier}</span>
           <button onClick={() => onRemove(item.symbol)} className="text-xs text-neutral-500 hover:text-neutral-300">
             remove
           </button>
@@ -196,8 +180,12 @@ function Card({
           </div>
           <p className="mt-2 text-sm text-neutral-300">{c.primaryReason}</p>
           {c.newsHeadline && <p className="mt-1 text-xs italic text-violet-300">&ldquo;{c.newsHeadline}&rdquo;</p>}
-          {c.secondaryReasons.map((r, i) => (
-            <p key={i} className="text-xs text-neutral-500">
+          {c.secondaryReasons.map((r) => (
+            // Content itself as the key, not the array index — which
+            // signal lands at which index can change between polls
+            // depending on which conditions fire, so an index key risks
+            // React reusing the wrong DOM node across a re-render.
+            <p key={r} className="text-xs text-neutral-500">
               {r}
             </p>
           ))}
@@ -236,7 +224,13 @@ export default function Home() {
   }, []);
 
   useEffect(() => {
-    if (handle && typeof handle === "string") {
+    // "loading" is itself typeof "string", so a bare `typeof === "string"`
+    // check (or a truthy check) matches the sentinel too — this used to
+    // fire an authenticated fetch to /api/watchlist before identity
+    // resolution even completed, on every page load. Harmless in practice
+    // (it 401s and gets silently swallowed) but wrong: this guard means
+    // "we have a real handle," and "loading" isn't one.
+    if (handle && handle !== "loading") {
       refresh();
       const id = setInterval(refresh, 15_000);
       return () => clearInterval(id);
@@ -253,11 +247,12 @@ export default function Home() {
   // and separate the unchanged so it can be visually demoted, not just
   // rendered in whatever order items happen to be in.
   const sorted = [...(data?.items ?? [])].sort((a, b) => {
-    const rankDiff = TIER_RANK[b.card?.tier ?? "QUIET"] - TIER_RANK[a.card?.tier ?? "QUIET"];
+    const rankDiff = TIER_CONFIG[b.card?.tier ?? "QUIET"].rank - TIER_CONFIG[a.card?.tier ?? "QUIET"].rank;
     if (rankDiff !== 0) return rankDiff;
     return Math.abs(b.card?.zScore ?? 0) - Math.abs(a.card?.zScore ?? 0);
   });
-  const needsAttention = sorted.filter((i) => i.card && i.card.tier !== "QUIET");
+  const needsAttention = sorted.filter((i) => i.card && i.card.tier !== "QUIET" && i.card.tier !== "NEW");
+  const newItems = sorted.filter((i) => i.card?.tier === "NEW");
   const unchanged = sorted.filter((i) => !i.card || i.card.tier === "QUIET");
 
   const removeSymbol = async (symbol: string) => {
@@ -346,7 +341,9 @@ export default function Home() {
       {data && data.items.length > 0 && (
         <p className="mt-4 text-sm text-neutral-400">
           {needsAttention.length === 0
-            ? `Nothing needs your attention — all ${data.items.length} quiet.`
+            ? unchanged.length > 0
+              ? `Nothing needs your attention — ${unchanged.length} quiet.`
+              : "New stocks below — check back later to see what changes."
             : `${needsAttention.length} of ${data.items.length} need your attention.`}
         </p>
       )}
@@ -359,10 +356,21 @@ export default function Home() {
         </div>
       )}
 
+      {newItems.length > 0 && (
+        <div className="mt-6">
+          <p className="mb-2 text-xs uppercase tracking-wide text-neutral-600">New</p>
+          <div className="space-y-2">
+            {newItems.map((item) => (
+              <Card key={item.symbol} item={item} onRemove={removeSymbol} onSimulate={simulateEvent} onClearSimulation={clearSimulation} />
+            ))}
+          </div>
+        </div>
+      )}
+
       {unchanged.length > 0 && (
         <div className="mt-6">
           <p className="mb-2 text-xs uppercase tracking-wide text-neutral-600">
-            {needsAttention.length > 0 ? "Unchanged" : "Your watchlist"}
+            {needsAttention.length > 0 || newItems.length > 0 ? "Unchanged" : "Your watchlist"}
           </p>
           <div className="space-y-2">
             {unchanged.map((item) => (

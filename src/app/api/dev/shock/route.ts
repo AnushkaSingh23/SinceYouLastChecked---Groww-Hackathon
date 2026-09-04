@@ -20,6 +20,17 @@ export async function POST(request: Request) {
   if (priceOverridePct === undefined && volumeAnomalyRatio === undefined) {
     return NextResponse.json({ error: "Provide priceOverridePct and/or volumeAnomalyRatio" }, { status: 400 });
   }
+  // A pct <= -1 (-100%) or beyond makes the resulting price zero or
+  // negative — found during review: -1.5 produced a currentPrice of
+  // -1156.20. Bound it to something that can never happen to a real stock
+  // but still supports any demo scenario (a >300% single-event spike is
+  // already absurd for a simulated news event).
+  if (priceOverridePct !== undefined && (priceOverridePct <= -1 || priceOverridePct > 3)) {
+    return NextResponse.json({ error: "priceOverridePct must be greater than -1 and at most 3" }, { status: 400 });
+  }
+  if (volumeAnomalyRatio !== undefined && volumeAnomalyRatio < 0) {
+    return NextResponse.json({ error: "volumeAnomalyRatio must be non-negative" }, { status: 400 });
+  }
 
   marketFeedStore.injectShock(symbol, { priceOverridePct, volumeAnomalyRatio, headline });
   return NextResponse.json({ ok: true });

@@ -8,11 +8,18 @@ import type { VolatilityResult } from "./volatility";
 import { TRADING_DAY_MS } from "./volatility";
 import type { VolumeAnomalyResult } from "./volumeAnomaly";
 
-export type Tier = "CRITICAL" | "NOTABLE" | "QUIET";
+// NEW is its own state, not a degenerate case of the tier system. A symbol
+// the user has never checked has no "since you last checked" baseline —
+// showing it as CRITICAL/NOTABLE would mean the badge is driven entirely by
+// signals that have nothing to do with the user's own history (a real
+// 52-week high plus real volume activity can both be true on a stock added
+// three seconds ago). That's a false alarm on day one, exactly contrary to
+// the point of the product. See DECISIONS.md.
+export type Tier = "CRITICAL" | "NOTABLE" | "QUIET" | "NEW";
 
-const TIER_RANK: Record<Tier, number> = { QUIET: 0, NOTABLE: 1, CRITICAL: 2 };
+const TIER_RANK: Record<Tier, number> = { QUIET: 0, NEW: 0, NOTABLE: 1, CRITICAL: 2 };
 const maxTier = (a: Tier, b: Tier): Tier => (TIER_RANK[a] >= TIER_RANK[b] ? a : b);
-const escalate = (t: Tier): Tier => (t === "QUIET" ? "NOTABLE" : "CRITICAL");
+const escalate = (t: Tier): Tier => (t === "QUIET" || t === "NEW" ? "NOTABLE" : "CRITICAL");
 
 // A z-score this large means "a move this big has historically been rare
 // for this stock" — see PRD.md / DECISIONS.md for why this is
@@ -71,58 +78,93 @@ export function scoreSymbol(params: {
   const { quote, lastSeen, volatility, volumeAnomaly } = params;
   const now = params.now ?? Date.now();
 
-  // "Never checked before" has no real elapsed-time reference to scale
-  // against (we don't know when prevClose was actually set, and guessing
-  // produces nonsense — a first-ever view of a symbol previously showed as
-  // a 36-sigma "CRITICAL" move because a tiny guessed elapsed time blew up
-  // the z-score, see ERRORS.md). So a first-time view gets no z-score at
-  // all: just today's plain change, tier QUIET unless an independent
-  // signal (level break / volume) fires. Tiering is about "what changed
-  // since YOU checked" — if you've never checked, there's nothing to diff.
-  const priceChangePct = lastSeen
-    ? (quote.price - lastSeen.price) / lastSeen.price
-    : quote.changePct / 100;
+  // high52w/low52w are null when Yahoo's response omits them — treat that
+  // as "we don't know," never as "crossed" (see ERRORS.md: defaulting a
+  // missing bound to the current price used to make this trivially true
+  // on every poll for any symbol with incomplete 52-week history).
+  const brokeHigh = quote.high52w !== null && quote.price >= quote.high52w;
+  const brokeLow = quote.low52w !== null && quote.price <= quote.low52w;
+  const isLevelBreak = brokeHigh || brokeLow;
 
-  let zScore: number | null = null;
-  let zScoreClamped = false;
-  if (lastSeen) {
-    const elapsedMs = Math.max(now - lastSeen.timestamp, 0);
-    const elapsedTradingFraction = Math.max(elapsedMs / TRADING_DAY_MS, MIN_ELAPSED_FRACTION);
-    const expectedMoveForElapsed = volatility.sigma * Math.sqrt(elapsedTradingFraction);
-    const rawZ = expectedMoveForElapsed > 0 ? Math.abs(priceChangePct) / expectedMoveForElapsed : null;
-    if (rawZ !== null && rawZ > MAX_DISPLAY_Z) {
-      zScore = MAX_DISPLAY_Z;
-      zScoreClamped = true;
-    } else {
-      zScore = rawZ;
+  // "Never checked before" is its own state (NEW), not a shot at
+  // CRITICAL/NOTABLE. There's no "since you last checked" baseline yet, so
+  // there's nothing to diff — a level-break or volume spike is a real fact
+  // about the stock, but neither has anything to do with the user's own
+  // history, and showing a freshly-added stock as an alarming red CRITICAL
+  // on day one directly contradicts what this product is for. See
+  // DECISIONS.md. Genuinely true facts (level break, volume) still surface
+  // as secondary context, just without driving the tier.
+  if (!lastSeen) {
+    const priceChangePct = quote.prevClose > 0 ? (quote.price - quote.prevClose) / quote.prevClose : 0;
+    const secondaryReasons: string[] = [];
+    if (isLevelBreak) {
+      const level = brokeHigh ? quote.high52w! : quote.low52w!;
+      secondaryReasons.push(`Currently at its 52-week ${brokeHigh ? "high" : "low"} (₹${level.toFixed(2)}).`);
     }
+    if (volumeAnomaly.isAnomaly && volumeAnomaly.ratio !== null) {
+      secondaryReasons.push(`Volume is ${volumeAnomaly.ratio.toFixed(1)}x${volumeAnomaly.ratioClamped ? "+" : ""} its recent pace right now.`);
+    }
+    return {
+      symbol: quote.symbol,
+      currentPrice: quote.price,
+      priceChangePct,
+      zScore: null,
+      zScoreClamped: false,
+      tier: "NEW",
+      primaryReason: "New to your watchlist — baseline created.",
+      secondaryReasons,
+      isLevelBreak,
+      isVolumeAnomaly: volumeAnomaly.isAnomaly,
+      volatilityIsLive: volatility.isLive,
+      dataFreshnessSec: Math.max(0, Math.round((now - quote.sourceTimestamp) / 1000)),
+    };
+  }
+
+  // Derived from price vs. lastSeen.price rather than trusting
+  // quote.changePct: this way it automatically reflects a dev-shock price
+  // override (which only rewrites `price`, not `changePct`) instead of
+  // silently showing the real, unshocked change next to a simulated price
+  // — that inconsistency was a real bug caught in review, see ERRORS.md.
+  const priceChangePct = (quote.price - lastSeen.price) / lastSeen.price;
+
+  // Tier decisions always use the RAW z-score, never the display-clamped
+  // one — capping is a display concern only. (A previous version clamped
+  // the same variable used for both, which happened to produce the same
+  // tier outcomes only because MAX_DISPLAY_Z > Z_CRITICAL; keeping them
+  // explicitly separate means that's true by construction, not by luck.)
+  const elapsedMs = Math.max(now - lastSeen.timestamp, 0);
+  const elapsedTradingFraction = Math.max(elapsedMs / TRADING_DAY_MS, MIN_ELAPSED_FRACTION);
+  const expectedMoveForElapsed = volatility.sigma * Math.sqrt(elapsedTradingFraction);
+  const rawZ = expectedMoveForElapsed > 0 ? Math.abs(priceChangePct) / expectedMoveForElapsed : null;
+  let zScore: number | null = rawZ;
+  let zScoreClamped = false;
+  if (rawZ !== null && rawZ > MAX_DISPLAY_Z) {
+    zScore = MAX_DISPLAY_Z;
+    zScoreClamped = true;
   }
   const zScoreLabel = (z: number) => `${z.toFixed(1)}σ${zScoreClamped ? "+" : ""}`;
 
   const secondaryReasons: string[] = [];
   let tier: Tier = "QUIET";
-  let primaryReason = lastSeen
-    ? "No notable activity since last check."
-    : `Just added — ${quote.changePct >= 0 ? "up" : "down"} ${Math.abs(quote.changePct).toFixed(1)}% today.`;
+  let primaryReason = "No notable activity since last check.";
   const defaultReason = primaryReason;
   let signalCount = 0;
 
-  if (zScore !== null) {
-    if (zScore >= Z_CRITICAL) {
+  if (rawZ !== null && zScore !== null) {
+    if (rawZ >= Z_CRITICAL) {
       tier = maxTier(tier, "CRITICAL");
       primaryReason = `Price moved ${(priceChangePct * 100).toFixed(1)}% — a ${zScoreLabel(zScore)} move, unusual for this stock.`;
       signalCount++;
-    } else if (zScore >= Z_NOTABLE) {
+    } else if (rawZ >= Z_NOTABLE) {
       tier = maxTier(tier, "NOTABLE");
       primaryReason = `Price moved ${(priceChangePct * 100).toFixed(1)}% (${zScoreLabel(zScore)} for this stock).`;
       signalCount++;
     }
   }
 
-  const isLevelBreak = quote.price >= quote.high52w || quote.price <= quote.low52w;
   if (isLevelBreak) {
-    const direction = quote.price >= quote.high52w ? "high" : "low";
-    const reason = `Crossed its 52-week ${direction} (₹${(direction === "high" ? quote.high52w : quote.low52w).toFixed(2)}).`;
+    const level = brokeHigh ? quote.high52w! : quote.low52w!;
+    const reason = `Crossed its 52-week ${brokeHigh ? "high" : "low"} (₹${level.toFixed(2)}).`;
     tier = maxTier(tier, "NOTABLE");
     if (primaryReason === defaultReason) primaryReason = reason;
     else secondaryReasons.push(reason);
@@ -130,7 +172,7 @@ export function scoreSymbol(params: {
   }
 
   if (volumeAnomaly.isAnomaly && volumeAnomaly.ratio !== null) {
-    const reason = `Volume is ${volumeAnomaly.ratio.toFixed(1)}x this stock's recent pace.`;
+    const reason = `Volume is ${volumeAnomaly.ratio.toFixed(1)}x${volumeAnomaly.ratioClamped ? "+" : ""} this stock's recent pace.`;
     tier = maxTier(tier, "NOTABLE");
     if (primaryReason === defaultReason) primaryReason = reason;
     else secondaryReasons.push(reason);

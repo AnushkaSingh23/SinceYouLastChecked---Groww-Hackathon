@@ -9,15 +9,28 @@
 // this session's own rolling average delta for that symbol.
 
 const MIN_DELTAS_FOR_LIVE = 5;
-const ANOMALY_RATIO_THRESHOLD = 2.5;
+// Exported so the shock injector can classify a simulated ratio the same
+// way real data is classified, instead of unconditionally calling any
+// injected ratio "an anomaly" regardless of its value.
+export const ANOMALY_RATIO_THRESHOLD = 2.5;
+
+// Same category of bug as the z-score display cap (see scoring.ts /
+// ERRORS.md): `delta / avgDelta` is only guarded against avgDelta being
+// exactly 0, not against it being small. A run of quiet polls followed by
+// one normal-volume poll can produce an arbitrarily large, genuinely-
+// computed-but-uncommunicative ratio like "847.3x" — same failure mode,
+// same fix: cap what's displayed, flag that it was capped.
+const MAX_DISPLAY_RATIO = 10;
 
 export interface VolumeAnomalyResult {
   isAnomaly: boolean;
   ratio: number | null;
+  /** True if ratio hit the display ceiling (MAX_DISPLAY_RATIO) — the real ratio was even larger. */
+  ratioClamped: boolean;
   isLive: boolean;
 }
 
-const NO_SIGNAL: VolumeAnomalyResult = { isAnomaly: false, ratio: null, isLive: false };
+const NO_SIGNAL: VolumeAnomalyResult = { isAnomaly: false, ratio: null, ratioClamped: false, isLive: false };
 
 export class VolumeAnomalyTracker {
   private lastCumulativeVolume: number | null = null;
@@ -42,8 +55,14 @@ export class VolumeAnomalyTracker {
     const delta = cumulativeVolume - this.lastCumulativeVolume;
     this.lastCumulativeVolume = cumulativeVolume;
 
-    // Cumulative volume resets at a new session (delta goes negative) — drop it.
+    // Cumulative volume resets at a new session (delta goes negative).
+    // Also clear the rolling buffer, not just the last result — otherwise
+    // the new session's early ratios blend against stale deltas left over
+    // from the previous session (relevant here: this hackathon's window
+    // has a real multi-day gap between Friday's and Monday's sessions, and
+    // the server is designed to survive across it, see marketHours.ts).
     if (delta < 0) {
+      this.deltas = [];
       this.lastResult = NO_SIGNAL;
       return this.lastResult;
     }
@@ -55,12 +74,14 @@ export class VolumeAnomalyTracker {
     }
 
     const avgDelta = this.deltas.reduce((a, b) => a + b, 0) / this.deltas.length;
-    const ratio = avgDelta > 0 ? delta / avgDelta : 1;
+    const rawRatio = avgDelta > 0 ? delta / avgDelta : 1;
+    const ratioClamped = rawRatio > MAX_DISPLAY_RATIO;
+    const ratio = ratioClamped ? MAX_DISPLAY_RATIO : rawRatio;
 
     this.deltas.push(delta);
     if (this.deltas.length > this.maxBufferSize) this.deltas.shift();
 
-    this.lastResult = { isAnomaly: ratio >= ANOMALY_RATIO_THRESHOLD, ratio, isLive: true };
+    this.lastResult = { isAnomaly: rawRatio >= ANOMALY_RATIO_THRESHOLD, ratio, ratioClamped, isLive: true };
     return this.lastResult;
   }
 

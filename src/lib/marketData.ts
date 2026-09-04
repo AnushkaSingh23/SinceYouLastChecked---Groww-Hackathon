@@ -16,8 +16,9 @@ export interface NSEQuote {
   price: number;
   changePct: number;
   volume: number;
-  high52w: number;
-  low52w: number;
+  /** null when Yahoo's response omits this — scoring.ts must not treat a missing bound as "crossed." */
+  high52w: number | null;
+  low52w: number | null;
   prevClose: number;
   /** Epoch ms of the exchange's own timestamp for this quote. */
   sourceTimestamp: number;
@@ -42,8 +43,14 @@ export async function fetchNSEQuote(symbol: string): Promise<NSEQuote | null> {
       price: meta.regularMarketPrice,
       changePct: meta.regularMarketChangePercent ?? 0,
       volume: meta.regularMarketVolume ?? 0,
-      high52w: meta.fiftyTwoWeekHigh ?? meta.regularMarketPrice,
-      low52w: meta.fiftyTwoWeekLow ?? meta.regularMarketPrice,
+      // If Yahoo omits these, defaulting to the current price would make
+      // `price >= high52w` (or `<= low52w`) trivially true forever — a
+      // permanent false "level break" for that symbol. null is explicit
+      // about "we don't know" instead of encoding it as a numeric sentinel
+      // (Infinity would also silently become `null` once this crosses a
+      // JSON response anyway, so there's no safe numeric trick here).
+      high52w: meta.fiftyTwoWeekHigh ?? null,
+      low52w: meta.fiftyTwoWeekLow ?? null,
       prevClose: meta.chartPreviousClose ?? meta.regularMarketPrice,
       sourceTimestamp: (meta.regularMarketTime ?? Math.floor(Date.now() / 1000)) * 1000,
     };

@@ -50,17 +50,13 @@ async function main() {
 
   const freshItem = listData.items.find((i: { symbol: string }) => i.symbol === "RELIANCE.NS");
   check("never-seen item has no z-score", freshItem?.card?.zScore === null);
-  // NOTE: we don't assert tier === QUIET here. A never-seen item can still
-  // legitimately be NOTABLE if there's a real, independent level-break or
-  // volume anomaly happening right now on live market data — that's correct
-  // behavior, not a bug (see ERRORS.md: this assertion used to be too rigid
-  // and produced a false failure during a real transient volume blip). What
-  // must always hold is that price-based tiering (the thing "never seen"
-  // actually changes) never fires without a last-seen baseline.
-  check(
-    "never-seen item's tier, if elevated, comes from level-break/volume only (not a phantom price z-score)",
-    freshItem?.card?.zScore === null && (freshItem?.card?.tier === "QUIET" || freshItem?.card?.isLevelBreak || freshItem?.card?.isVolumeAnomaly)
-  );
+  // A never-seen item is always tier NEW, full stop — never CRITICAL/
+  // NOTABLE, even if it happens to have a real level-break or volume
+  // anomaly right now (those are real facts, but have nothing to do with
+  // the user's own "since I checked" history — see DECISIONS.md). This
+  // used to be a looser assertion tolerating NOTABLE from a live signal;
+  // NEW replaces that entirely now.
+  check("never-seen item is tier NEW", freshItem?.card?.tier === "NEW");
 
   const markSeenRes = await fetch(`${BASE}/api/watchlist/mark-seen`, {
     method: "POST",
