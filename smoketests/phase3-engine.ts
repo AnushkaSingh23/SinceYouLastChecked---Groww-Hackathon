@@ -97,5 +97,19 @@ check(
   (shortElapsed.zScore ?? 0) > (longElapsed.zScore ?? 0)
 );
 
+// Test 5: a symbol with NO last-seen snapshot (just added to the
+// watchlist) must never explode into a huge z-score/CRITICAL tier — this
+// regressed for real: an early build showed a freshly-added stock as a
+// 36.9-sigma CRITICAL move because of a bad elapsed-time guess. See ERRORS.md.
+const freshAddQuote = makeQuote({ price: 1330.3, prevClose: 1302.5, changePct: 2.13, high52w: 1600, low52w: 1100 });
+const freshAddResult = scoreSymbol({
+  quote: freshAddQuote,
+  lastSeen: null,
+  volatility: { sigma: 0.016, isLive: false },
+  volumeAnomaly: NO_VOLUME_SIGNAL,
+});
+check(`never-seen-before symbol has no z-score (got ${freshAddResult.zScore})`, freshAddResult.zScore === null);
+check(`never-seen-before symbol is QUIET, not CRITICAL (got ${freshAddResult.tier})`, freshAddResult.tier === "QUIET");
+
 console.log(failures === 0 ? "\nAll phase 3 smoke checks passed." : `\n${failures} check(s) failed.`);
 process.exit(failures === 0 ? 0 : 1);

@@ -1,0 +1,45 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "sqlite"
+}
+
+// Lightweight identity, no password — a handle is enough to persist a
+// watchlist across sessions/devices (see PRD.md non-goals: no OAuth in v1).
+model User {
+  id        String   @id @default(cuid())
+  handle    String   @unique
+  createdAt DateTime @default(now())
+
+  watchlistItems WatchlistItem[]
+}
+
+model WatchlistItem {
+  id      String @id @default(cuid())
+  userId  String
+  user    User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  symbol  String
+
+  addedAt DateTime @default(now())
+
+  lastSeen LastSeenSnapshot?
+
+  @@unique([userId, symbol])
+}
+
+// What the user saw the last time they looked at this symbol — the state
+// every "what changed since you last checked" computation diffs against.
+model LastSeenSnapshot {
+  id              String        @id @default(cuid())
+  watchlistItemId String        @unique
+  watchlistItem   WatchlistItem @relation(fields: [watchlistItemId], references: [id], onDelete: Cascade)
+
+  price     Float
+  timestamp DateTime
+}

@@ -55,21 +55,32 @@ export function scoreSymbol(params: {
   const { quote, lastSeen, volatility, volumeAnomaly } = params;
   const now = params.now ?? Date.now();
 
-  // No prior visit yet: compare against previous close, over "time elapsed
-  // since today's session opened" as a stand-in reference window.
-  const referencePrice = lastSeen?.price ?? quote.prevClose;
-  const referenceTimestamp = lastSeen?.timestamp ?? quote.sourceTimestamp - (now - quote.sourceTimestamp);
-  const elapsedMs = Math.max(now - referenceTimestamp, 0);
+  // "Never checked before" has no real elapsed-time reference to scale
+  // against (we don't know when prevClose was actually set, and guessing
+  // produces nonsense — a first-ever view of a symbol previously showed as
+  // a 36-sigma "CRITICAL" move because a tiny guessed elapsed time blew up
+  // the z-score, see ERRORS.md). So a first-time view gets no z-score at
+  // all: just today's plain change, tier QUIET unless an independent
+  // signal (level break / volume) fires. Tiering is about "what changed
+  // since YOU checked" — if you've never checked, there's nothing to diff.
+  const priceChangePct = lastSeen
+    ? (quote.price - lastSeen.price) / lastSeen.price
+    : quote.changePct / 100;
 
-  const priceChangePct = referencePrice > 0 ? (quote.price - referencePrice) / referencePrice : 0;
-
-  const elapsedTradingFraction = Math.max(elapsedMs / TRADING_DAY_MS, MIN_ELAPSED_FRACTION);
-  const expectedMoveForElapsed = volatility.sigma * Math.sqrt(elapsedTradingFraction);
-  const zScore = expectedMoveForElapsed > 0 ? Math.abs(priceChangePct) / expectedMoveForElapsed : null;
+  let zScore: number | null = null;
+  if (lastSeen) {
+    const elapsedMs = Math.max(now - lastSeen.timestamp, 0);
+    const elapsedTradingFraction = Math.max(elapsedMs / TRADING_DAY_MS, MIN_ELAPSED_FRACTION);
+    const expectedMoveForElapsed = volatility.sigma * Math.sqrt(elapsedTradingFraction);
+    zScore = expectedMoveForElapsed > 0 ? Math.abs(priceChangePct) / expectedMoveForElapsed : null;
+  }
 
   const secondaryReasons: string[] = [];
   let tier: Tier = "QUIET";
-  let primaryReason = "No notable activity since last check.";
+  let primaryReason = lastSeen
+    ? "No notable activity since last check."
+    : `Just added — ${quote.changePct >= 0 ? "up" : "down"} ${Math.abs(quote.changePct).toFixed(1)}% today.`;
+  const defaultReason = primaryReason;
   let signalCount = 0;
 
   if (zScore !== null) {
@@ -89,7 +100,7 @@ export function scoreSymbol(params: {
     const direction = quote.price >= quote.high52w ? "high" : "low";
     const reason = `Crossed its 52-week ${direction} (₹${(direction === "high" ? quote.high52w : quote.low52w).toFixed(2)}).`;
     tier = maxTier(tier, "NOTABLE");
-    if (primaryReason === "No notable activity since last check.") primaryReason = reason;
+    if (primaryReason === defaultReason) primaryReason = reason;
     else secondaryReasons.push(reason);
     signalCount++;
   }
@@ -97,7 +108,7 @@ export function scoreSymbol(params: {
   if (volumeAnomaly.isAnomaly && volumeAnomaly.ratio !== null) {
     const reason = `Volume is ${volumeAnomaly.ratio.toFixed(1)}x this stock's recent pace.`;
     tier = maxTier(tier, "NOTABLE");
-    if (primaryReason === "No notable activity since last check.") primaryReason = reason;
+    if (primaryReason === defaultReason) primaryReason = reason;
     else secondaryReasons.push(reason);
     signalCount++;
   }

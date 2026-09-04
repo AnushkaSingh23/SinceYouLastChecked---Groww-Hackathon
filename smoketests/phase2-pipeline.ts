@@ -1,6 +1,8 @@
 // Smoke test for Phase 2 — data pipeline (requires `npm run dev` running).
 // Run with: npx tsx smoketests/phase2-pipeline.ts
 
+export {}; // force module scope so top-level names don't collide with other smoketest scripts under `tsc`
+
 const BASE = "http://localhost:3000";
 let failures = 0;
 

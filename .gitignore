@@ -32,6 +32,11 @@ yarn-error.log*
 
 # env files (can opt-in for committing if needed)
 .env*
+!.env.example
+
+# local sqlite database (created by prisma migrate — not shared, not a secret, just local runtime data)
+/dev.db
+/dev.db-journal
 
 # vercel
 .vercel
@@ -43,3 +48,5 @@ next-env.d.ts
 # internal planning/tracking docs — not part of the submission, kept local only
 *.md
 !README.md
+
+/src/generated/prisma

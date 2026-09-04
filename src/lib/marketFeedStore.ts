@@ -44,6 +44,10 @@ class MarketFeedStore {
     return Array.from(this.quotes.values());
   }
 
+  getQuote(symbol: string): NSEQuote | undefined {
+    return this.quotes.get(symbol);
+  }
+
   getLastPollAt(): number | null {
     return this.lastPollAt;
   }
@@ -90,7 +94,7 @@ class MarketFeedStore {
 }
 
 declare global {
-  // eslint-disable-next-line no-var
+   
   var __marketFeedStore: MarketFeedStore | undefined;
 }
 
