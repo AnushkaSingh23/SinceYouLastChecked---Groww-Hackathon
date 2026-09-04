@@ -50,3 +50,7 @@ next-env.d.ts
 !README.md
 
 /src/generated/prisma
+
+# local tooling + build artifacts (the zip contains a copy of this repo)
+.claude/
+/groww_hack.zip

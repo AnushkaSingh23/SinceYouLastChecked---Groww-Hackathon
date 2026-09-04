@@ -1,98 +1,324 @@
 # Since You Last Checked
 
-A smart watchlist for NSE (Indian stock market) equities. Built for
-**"Code, by Groww" — CODE 2026**.
+**A smart NSE watchlist that ranks what actually changed while you were away.**
 
-Most watchlists show you every number and make you find what matters. This
-one tracks what you've already seen, and only surfaces what actually earned
-your attention since then — with a plain-English reason attached to every
-flag, never just a badge.
+Built for *Code, by Groww* — CODE 2026.
 
-## What it does
+---
 
-- Create and manage a watchlist from a curated set of 40 liquid NSE stocks.
-- See live prices while the market is open (9:15am–3:30pm IST, Mon–Fri).
-- Come back later and see a **"Since you last checked"** view: what changed,
-  how much, and why — sorted by what deserves your attention, not by
-  whatever order you added things in.
-- "Meaningful change" is volatility-relative (a z-score against each stock's
-  own behavior), not a flat percentage — the same 2% move reads very
-  differently on a stable blue chip vs. a volatile growth stock.
-- Honest about stale/closed-market data: the app knows real NSE trading
-  hours and says so, instead of pretending to be live when it isn't.
-- A dev-only **shock injector** lets you simulate a price/volume event with
-  a headline on any watchlisted stock — since NSE is only open a few hours
-  total across a typical demo window, this is how CRITICAL/NOTABLE states
-  get shown on demand.
+## The problem
 
-See `PROJECT_BRIEF.md`, `PRD.md`, `ARCHITECTURE.md`, and `DECISIONS.md` in
-this repo for the full reasoning behind these choices (local-only files, not
-tracked in git — see below).
+A watchlist shows you forty rows of green and red numbers and leaves you the
+hard part: **which of these actually matters?** You scan everything, every
+time, and you still miss things.
+
+This app answers that question instead of asking it.
+
+## The two bets it makes
+
+**1. A percentage is meaningless without context.**
+A 2% move is a non-event for HDFC Bank and an emergency for Adani Enterprises.
+So nothing here is ranked by raw percentage. Every move is scored against *that
+specific stock's own* typical volatility — how unusual is this, **for this
+stock**, in the time you were away.
+
+**2. The useful unit is the diff since *your* last visit, not the price.**
+That is why there is a sign-in at all, why "Mark as seen" exists, and why the
+app measures elapsed time in **trading hours** rather than wall-clock hours.
+
+Everything below follows from those two ideas.
+
+---
+
+## How the scoring works
+
+Four independent signals combine into one tier per stock, and every tier traces
+back to a plain-English sentence — so *"why was this flagged?"* always has a
+real answer. There is no black-box score.
+
+### 1. Volatility-relative price move
+
+```
+z = |% move since you last checked| / (σ × √(elapsed trading time))
+```
+
+- **σ** is the stock's daily-equivalent volatility. It starts from a
+  hand-checked seed per ticker and switches to **live-observed** volatility once
+  enough real ticks arrive this session. The card tells you which is in use
+  (`live volatility` vs `seed volatility (warming up)`) rather than hiding it.
+- **√(elapsed time)** is standard square-root-of-time scaling — the same maths
+  behind annualising a daily volatility. A move is more surprising the less time
+  it had to happen in.
+
+Thresholds: **z ≥ 1.5 → NOTABLE**, **z ≥ 3.0 → CRITICAL**.
+
+### 2. Trading-time elapsed — the fix that makes the premise true
+
+This is the most important piece of engineering in the project, and it started
+as a bug that quietly broke the entire product.
+
+The market is open **6h15m a day**. A Friday-evening-to-Monday-morning gap is
+~66 *wall-clock* hours and roughly **zero trading hours**. Measuring elapsed
+time with a wall clock bills that weekend as ~2.6 trading days of expected
+drift, the `√t` denominator inflates, and the z-score collapses.
+
+**The concrete failure:** a real 5% weekend gap scored **0.57σ → QUIET →
+*"No notable activity since last check."*** On exactly the return visit the
+product is named after.
+
+`tradingElapsedBetween()` now walks the calendar day by day and counts only
+genuine open-market milliseconds, skipping nights, weekends and known holidays.
+It also returns **how many market opens you slept through**.
+
+Overnight gaps are not treated as zero-risk — a shut market still reopens on
+news that broke while it was closed. Each missed session open is charged a flat
+**0.2 of a trading day** of variance (the standard empirical range is
+0.15–0.25). Without that, a 9:16am check against a 6pm baseline would see ~1
+minute of elapsed trading time and call every ordinary opening tick a 10σ event.
+
+| Real 5% move, σ = 2.7% | Before | After |
+|---|---|---|
+| Friday close → Monday morning | 0.57σ · QUIET | **3.78σ · CRITICAL** |
+| Thursday evening → Friday morning | 1.10σ · QUIET | **3.78σ · CRITICAL** |
+| *Ordinary 0.4% move over a weekend* | — | *0.30σ · QUIET* |
+
+That last row matters as much as the first two. Making real gaps loud is easy;
+making them loud **without** making ordinary ones loud is the actual problem.
+
+### 3. Volume — a graded signal, not a boolean
+
+Yahoo reports cumulative day-volume, so the app tracks the **delta between
+consecutive polls** and compares it to that stock's own recent pace.
+
+| Ratio vs. recent pace | Level | Weight | Reaches alone |
+|---|---|---|---|
+| under 1.5× | Normal | 0 | — |
+| 1.5× – 3× | Elevated | 1 | NOTABLE |
+| 3×+, single poll | Surge | 1 | NOTABLE |
+| **3×+, held ≥ 2 polls** | **Confirmed surge** | **2** | **CRITICAL** |
+
+So rising volume genuinely escalates a stock QUIET → NOTABLE → CRITICAL with no
+price signal required. Three robustness choices, each fixing an observed false
+positive:
+
+- **Median baseline, not mean.** A mean lets a surge inflate its own denominator
+  and normalise itself away *while it is still happening*.
+- **Zero deltas are excluded.** A poll where nothing traded is the *absence* of a
+  pace measurement, not a measurement of zero pace. Including zeros made the
+  first real print after a quiet stretch read as a ~30× anomaly.
+- **A surge must hold for two polls to reach CRITICAL.** NSE volume is U-shaped;
+  a single 20-second print at 3× is routine into the close. Without this,
+  testing against the live feed at 3:10pm painted most of the list red on ~0.2%
+  price moves.
+
+### 4. 52-week level breaks
+
+Flags a stock crossing its 52-week high or low. If the data source omits a
+bound, it is treated as **unknown**, never as "crossed" — defaulting a missing
+bound to the current price makes `price >= high` trivially true forever.
+
+### How tiers combine
+
+```
+weight ≥ 2  →  escalate one tier  (QUIET/NEW → NOTABLE → CRITICAL)
+```
+
+Two independent signals agreeing has always counted as more meaningful than
+either alone. A confirmed volume surge now carries that weight by itself.
+
+### `NEW` is a real state, not a fallback
+
+A stock you have never checked has no baseline, so it cannot honestly have a
+diff. It gets its own tier.
+
+This matters more than it sounds. A stock added three seconds ago can genuinely
+be at its 52-week high with genuinely unusual volume — two real signals that
+would combine into a red `CRITICAL` about a stock with zero user history. That
+is a false alarm on day one, precisely contrary to the point of the app. `NEW`
+never escalates; the real facts still show as context.
+
+---
+
+## Making "seen" actually mean something
+
+**Mark all as seen** sets your baseline; **got it** acknowledges one card.
+
+The snapshot records **what you acknowledged, not just the price**: the price,
+the timestamp, whether it was at a 52-week bound, and the volume ratio.
+
+Without that, "seen" only reset the price — so a stock sitting at its 52-week
+high or in a volume surge **stayed flagged forever** no matter how many times
+you acknowledged it, and *"3 of 9 need your attention"* could never reach zero.
+An alerting product that ignores you teaches you to ignore it. Volume re-flags
+only when it climbs 25% beyond what you already saw.
+
+Every card shows the diff explicitly:
+
+> ₹1,322.00 → ₹1,240.04 · last checked Fri, 3:26 pm IST (4 hr ago)
+
+---
+
+## Honest about what it doesn't know
+
+- Real NSE session awareness. The next session is **named**, not vague — on a
+  Friday evening it says *"Opens Monday at 9:15 AM IST"*, skipping the weekend
+  and any holiday.
+- Per-card data age with proper rollover (`45s`, `12m`, `4h`, `2d`).
+- **Feed health.** The "data as of" time is the last time data was actually
+  *received*, never the last attempt — the banner used to stay confident while
+  every symbol was failing.
+- It says when volatility is still seeded rather than learned.
+
+---
 
 ## Setup
 
-Requires Node.js 20+.
+Requires **Node.js 20.9+**. No API key, no database server, no account.
 
 ```bash
 npm install
-cp .env.example .env
+cp .env.example .env      # Windows: copy .env.example .env
 npx prisma migrate dev
 npm run dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000). Enter any name to
-create a watchlist — no password, no signup, no external API key needed.
-The market data source (Yahoo Finance's public NSE quote endpoint) doesn't
-require authentication.
+Open <http://localhost:3000>.
 
-`npm install` also runs `prisma generate` automatically (via `postinstall`).
-If you ever change `prisma/schema.prisma`, re-run `npx prisma migrate dev`.
+`npm install` runs `prisma generate` via `postinstall`. If you change
+`prisma/schema.prisma`, re-run `npx prisma migrate dev`.
 
-## Using it
+### Using it
 
-1. Add a few stocks from the dropdown.
-2. Click **"Mark all as seen"** to set a baseline.
-3. Watch the "Since you last checked" view update live as the market moves
-   (polls every ~20 seconds while NSE is open).
-4. Outside market hours, or to demo a specific scenario immediately, use the
-   **"⚡ simulate event"** button on any card — it injects a realistic price
-   move, volume spike, and headline without touching real market data.
+1. Enter any name — no password. The name *is* the account.
+2. Search stocks by name, symbol or sector; click a result to add it.
+3. Click **Mark all as seen** to set your baseline.
+4. Click **⚡ simulate event** on any card. NSE is open six hours a day, so
+   outside those hours there is genuinely nothing to see — this injects a
+   realistic price move, volume spike and headline so the scoring can be
+   demonstrated on demand.
+5. Watch the card jump to **CRITICAL** with a reason. Filter with the tabs
+   (All / Needs attention / New / Unchanged).
+6. Click **got it** to acknowledge it and return the list to quiet.
 
-## Verifying it works
+`bash demo-setup.sh` arms all of this in one command.
 
-Standalone smoke tests (no test framework, just scripted assertions) cover
-each phase of the build:
+---
 
-```bash
-npx tsx smoketests/phase1-foundation.ts    # data foundation, no server needed
-npx tsx smoketests/phase3-engine.ts        # scoring engine, no server needed
+## Testing
 
-# the rest need `npm run dev` running in another terminal:
-npx tsx smoketests/phase2-pipeline.ts      # market data pipeline + SSE
-npx tsx smoketests/phase4-persistence.ts   # watchlist CRUD + persistence
-npx tsx smoketests/phase5-shock-injector.ts # dev shock injector
-```
-
-A production build is also verified clean:
+Seven suites. Two run fully offline:
 
 ```bash
-npm run build
-npm start
+npm test      # scoring engine + trading-time/volume signals
 ```
 
-## Notable engineering decisions
+The rest need `npm run dev` in another terminal:
 
-- **NSE, not US markets** — this is a Groww-inspired product for Groww's
-  actual (Indian) users, and it turned out to also give a better live-data
-  window for this specific hackathon's dates.
-- **No historical price data dependency** — volatility is learned live from
-  the running session (seeded with a sensible starting estimate per stock),
-  not fetched from a fragile/gated historical-candles API.
-- **In-memory live data, persisted user state** — the live quote cache and
-  volatility trackers are in-memory (fine to lose on restart, they rebuild
-  fast); the watchlist and "last seen" snapshots are in SQLite, because
-  that's the state the product's whole premise depends on surviving a
-  restart or a return visit days later.
+```bash
+npx tsx smoketests/phase1-foundation.ts     # all 40 tickers resolve
+npx tsx smoketests/phase2-pipeline.ts       # data pipeline + SSE
+npx tsx smoketests/phase4-persistence.ts    # watchlist CRUD + persistence
+npx tsx smoketests/phase5-shock-injector.ts # demo overlay + its guards
+npx tsx smoketests/phase6-longterm-trend.ts # trend feature
+```
 
-Full write-up of these trade-offs, plus every bug hit and fixed along the
-way, is in the local-only `DECISIONS.md` / `ERRORS.md` files.
+Every scoring test pins an **explicit timestamp**. Because the engine measures
+trading time, "one hour ago" means something different at 2pm Tuesday than at
+2am Sunday — a test reading the wall clock would pass or fail depending on when
+it ran.
+
+---
+
+## Architecture
+
+```
+Yahoo Finance v8  →  one shared poll loop  →  in-memory quote cache
+                                           →  volatility trackers  ─┐
+                                           →  volume trackers      ─┤
+                                                                    ├→ scoring → tier + reason
+SQLite ──→ watchlist + "last seen" snapshot per user ───────────────┘
+```
+
+**Live market state is in memory; user state is in SQLite.** The quote cache and
+trackers rebuild quickly and are fine to lose on restart. The watchlist and
+last-seen snapshots are the state the product's premise depends on surviving a
+restart or a return visit days later, so those are persisted.
+
+**One shared polling loop serves every connected browser** — 40 symbols, not
+40 × users. It has an in-flight guard so a slow cycle cannot stack, an 8-second
+request timeout, exponential backoff on failure, and it drops to a 5-minute
+heartbeat when the market is closed (polling at full rate around the clock is
+~172,800 requests/day for data that cannot change). Older responses can never
+overwrite newer ones, and repeated identical quotes are not learned twice —
+recording an untraded stock's unchanged quote as a fresh tick buries real
+returns under zeros, understates σ, and makes ordinary moves read as CRITICAL.
+
+**Data source:** Yahoo Finance's public v8 chart endpoint. The commonly
+recommended v7 batch endpoint now returns 401 without a session cookie and crumb
+token, so this uses v8 with a small concurrency cap instead of one batched call.
+The 40-ticker list is current — it corrects two tickers that changed through
+real corporate actions (`ZOMATO` → `ETERNAL`, `TATAMOTORS` → `TMPV`).
+
+**Stack:** Next.js 16 (App Router) · React 19 · TypeScript · Tailwind v4 ·
+Prisma 7 + SQLite via the `better-sqlite3` driver adapter.
+
+---
+
+## Identity, and what it does not protect
+
+There is no password. You type a name, and that name is your watchlist — the
+same name on any device brings back the same list.
+
+**This means the watchlist is not private.** Anyone who types your name sees
+your list. That is a deliberate trade-off for a demo rather than an oversight,
+and the app says so on the sign-in screen instead of leaving you to assume
+otherwise. `switch` in the header clears the session.
+
+Real auth is the first thing to add before this saw a real user.
+
+---
+
+## Deploying
+
+**This is a long-running process with a writable database file, not a
+serverless app.** On Vercel-style hosts the read-only filesystem breaks SQLite
+and cold starts break the polling engine, which *learns* over successive polls —
+it would build, load, and do nothing interesting.
+
+Use anything that gives you a container and a persistent volume (Railway,
+Render, Fly). A `Dockerfile` and entrypoint are included; the entrypoint runs
+migrations, seeds a `demo` account, then serves.
+
+Two environment variables matter:
+
+| Variable | Value | Why |
+|---|---|---|
+| `DATABASE_URL` | `file:/data/dev.db` | Must point at the mounted volume, or every restart wipes all watchlists |
+| `ENABLE_DEMO_SHOCKS` | `true` | ⚡ is **disabled in production by default** — unguarded it is an anonymous public write that pushes a fabricated headline about a real listed company onto every viewer's screen |
+
+---
+
+## Known limitations
+
+Stated plainly, because knowing where a system is weak is part of building it.
+
+- **Single instance only.** The quote cache, volatility trackers and demo
+  overlays live in one process; two instances would poll twice, learn different
+  volatilities, and disagree about active events. The fix is a shared cache
+  (Redis), Postgres, and a dedicated poller worker.
+- **Nothing between visits is recorded.** If a stock drops 9% at 10:00 and
+  recovers by 14:00, a 15:00 visit sees "quiet". An append-only event log is the
+  highest-value next feature — it turns *"what's different"* into *"here's what
+  happened."*
+- **Volume is not time-of-day normalised.** NSE volume is U-shaped; 2.5× is
+  unremarkable at 9:20 and significant at 12:30. The two-poll confirmation is a
+  mitigation, not the real fix.
+- **Only verified NSE holidays are in the calendar.** A wrong holiday is worse
+  than a missing one — it would make the app claim "closed" on a real trading
+  day.
+- **σ seeds are hand-written** and will drift. Deriving them from real historical
+  bars at startup would remove the hardcoded table.
+- **No sector- or index-relative context.** *"ITC is down 3.1% while FMCG is
+  flat"* and *"ITC is down 3.1% and FMCG is down 2.9%"* are completely different
+  news; the app currently says the same thing for both.
+- **News headlines appear only on simulated events.**

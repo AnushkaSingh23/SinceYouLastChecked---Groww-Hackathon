@@ -16,6 +16,13 @@
 // user's actual elapsed time since last-seen is.
 
 import { NSE_40_UNIVERSE } from "./nseUniverse";
+import { TRADING_DAY_MS } from "./marketHours";
+
+// One canonical definition of a session's length, owned by marketHours.ts
+// (which also knows *which* wall-clock spans count as trading time).
+// Re-exported here because this module is where the daily-equivalent scaling
+// happens, so callers reading this file expect to find it.
+export { TRADING_DAY_MS };
 
 const SEED_SIGMA_BY_SYMBOL: Record<string, number> = Object.fromEntries(
   NSE_40_UNIVERSE.map((s) => [s.symbol, s.baseSigma])
@@ -23,9 +30,6 @@ const SEED_SIGMA_BY_SYMBOL: Record<string, number> = Object.fromEntries(
 
 const DEFAULT_SEED_SIGMA = 0.015;
 const MIN_TICKS_FOR_LIVE_VOL = 10;
-
-// NSE trading session length: 9:15am-3:30pm IST = 6h15m.
-export const TRADING_DAY_MS = (6 * 60 + 15) * 60 * 1000;
 
 export interface PriceTick {
   price: number;

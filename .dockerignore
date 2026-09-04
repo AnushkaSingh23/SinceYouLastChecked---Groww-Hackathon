@@ -1,0 +1,14 @@
+node_modules
+.next
+.git
+.env
+dev.db
+dev.db-journal
+*.tsbuildinfo
+src/generated
+groww_hack.zip
+.claude
+.agents
+.windsurf
+*.md
+!README.md

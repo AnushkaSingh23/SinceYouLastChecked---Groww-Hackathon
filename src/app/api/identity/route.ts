@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { identify, requireCurrentUser } from "@/lib/auth";
+import { identify, requireCurrentUser, signOut } from "@/lib/auth";
 
 export async function GET() {
   const user = await requireCurrentUser();
@@ -16,4 +16,11 @@ export async function POST(request: Request) {
   } catch (err) {
     return NextResponse.json({ error: err instanceof Error ? err.message : "Invalid handle" }, { status: 400 });
   }
+}
+
+// Sign out = drop the session cookie. There is nothing server-side to revoke
+// (the cookie IS the session), so this is the whole operation.
+export async function DELETE() {
+  await signOut();
+  return NextResponse.json({ ok: true });
 }

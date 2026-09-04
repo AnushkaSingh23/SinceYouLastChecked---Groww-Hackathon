@@ -29,9 +29,18 @@ const CHART_URL = (symbol: string) =>
 
 const BROWSER_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64)";
 
+// One hung socket must not block its whole batch indefinitely — without a
+// timeout, a single stalled request stalls the Promise.all it belongs to,
+// and the poll cycle behind it, for as long as the socket stays open.
+const REQUEST_TIMEOUT_MS = 8_000;
+
 export async function fetchNSEQuote(symbol: string): Promise<NSEQuote | null> {
   try {
-    const res = await fetch(CHART_URL(symbol), { headers: { "User-Agent": BROWSER_UA } });
+    const res = await fetch(CHART_URL(symbol), {
+      headers: { "User-Agent": BROWSER_UA },
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      cache: "no-store",
+    });
     if (!res.ok) return null;
 
     const data = await res.json();

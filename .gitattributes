@@ -1,0 +1,23 @@
+# Normalise text files in the repository, and let Git decide the working-copy
+# ending per platform.
+* text=auto
+
+# These MUST stay LF, always, on every platform.
+#
+# core.autocrlf=true (the Windows default) rewrites checked-out files to CRLF.
+# A shell script with CRLF endings has a trailing carriage return on its
+# shebang — `#!/usr/bin/env sh\r` — so Linux tries to execute an interpreter
+# literally named "sh\r" and fails with "no such file or directory", pointing
+# at a file that plainly exists. The Docker entrypoint would break on any
+# machine that cloned this on Windows.
+*.sh          text eol=lf
+Dockerfile    text eol=lf
+*.yml         text eol=lf
+*.yaml        text eol=lf
+
+# Binary — never touch these.
+*.png binary
+*.jpg binary
+*.ico binary
+*.zip binary
+*.db  binary

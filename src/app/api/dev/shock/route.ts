@@ -1,11 +1,39 @@
 import { NextResponse } from "next/server";
+import { getCurrentUserId } from "@/lib/auth";
 import { marketFeedStore } from "@/lib/marketFeedStore";
 import { NSE_40_UNIVERSE } from "@/lib/nseUniverse";
 
 // Dev/demo-only: inject or clear a simulated market event on a symbol.
 // Not user-scoped — this overlays the shared live feed everyone sees, which
 // is the point: it's a presenter's control, not a per-user preference.
+//
+// That shared-state design is exactly why this needs a gate. Unguarded, a
+// deployed build lets an anonymous caller push a fabricated price move and a
+// fabricated news headline about a real, named, publicly traded company onto
+// every viewer's screen, and wipe everyone's simulations with a DELETE. The
+// SIMULATED badge is the only mitigation and it's client-side.
+//
+// Enabled automatically outside production. In a deployed demo, set
+// ENABLE_DEMO_SHOCKS=true to turn it back on — an explicit opt-in, so the
+// live demo still works without the endpoint being open by default.
+function demoShocksEnabled(): boolean {
+  return process.env.NODE_ENV !== "production" || process.env.ENABLE_DEMO_SHOCKS === "true";
+}
+
+// A function, not a shared constant: a Response body can only be consumed
+// once, so handing the same instance to two requests breaks the second.
+const disabledResponse = () =>
+  NextResponse.json(
+    { error: "Simulated events are disabled. Set ENABLE_DEMO_SHOCKS=true to enable them." },
+    { status: 404 }
+  );
+
 export async function POST(request: Request) {
+  if (!demoShocksEnabled()) return disabledResponse();
+  // Even when enabled, require an identified user — a demo control is for
+  // someone using the app, not for an anonymous caller on the internet.
+  if (!(await getCurrentUserId())) return NextResponse.json({ error: "Not identified" }, { status: 401 });
+
   const body = await request.json().catch(() => null);
   const symbol = typeof body?.symbol === "string" ? body.symbol : "";
 
@@ -37,6 +65,9 @@ export async function POST(request: Request) {
 }
 
 export async function DELETE(request: Request) {
+  if (!demoShocksEnabled()) return disabledResponse();
+  if (!(await getCurrentUserId())) return NextResponse.json({ error: "Not identified" }, { status: 401 });
+
   const url = new URL(request.url);
   const symbol = url.searchParams.get("symbol");
 

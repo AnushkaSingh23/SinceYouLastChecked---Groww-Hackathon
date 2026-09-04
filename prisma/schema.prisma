@@ -42,4 +42,13 @@ model LastSeenSnapshot {
 
   price     Float
   timestamp DateTime
+
+  // What the user had already *acknowledged*, not just the price. Without
+  // these, "mark all as seen" only resets the price baseline: a stock
+  // sitting at its 52-week high or in a volume surge stays flagged forever
+  // no matter how many times it's acknowledged, and the "N need your
+  // attention" headline never returns to zero. scoring.ts diffs against
+  // these so every signal is genuinely "since you last checked."
+  levelBreak  Boolean @default(false)
+  volumeRatio Float?
 }

@@ -1,5 +1,11 @@
 // Smoke test for Phase 5 — dev shock injector (requires `npm run dev`
 // running). Run with: npx tsx smoketests/phase5-shock-injector.ts
+//
+// Every /api/dev/shock call carries the session cookie: the endpoint is no
+// longer an open unauthenticated write (it overlays a fabricated price move
+// and headline onto the shared feed every viewer sees), so it requires an
+// identified user, and is disabled entirely in production builds unless
+// ENABLE_DEMO_SHOCKS=true. See src/app/api/dev/shock/route.ts.
 
 export {};
 
@@ -38,7 +44,7 @@ async function main() {
   // Reject unknown symbols.
   const badRes = await fetch(`${BASE}/api/dev/shock`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: authHeaders,
     body: JSON.stringify({ symbol: "NOT_A_REAL_SYMBOL", priceOverridePct: -0.05 }),
   });
   check("shock injector rejects an unknown symbol", badRes.status === 400);
@@ -46,7 +52,7 @@ async function main() {
   // Inject a shock: -6% price move + volume spike.
   const injectRes = await fetch(`${BASE}/api/dev/shock`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: authHeaders,
     body: JSON.stringify({ symbol: "SUZLON.NS", priceOverridePct: -0.06, volumeAnomalyRatio: 4.5, headline: "Test headline" }),
   });
   check("shock injection succeeds", injectRes.ok);
@@ -65,7 +71,7 @@ async function main() {
   );
 
   // Clear this one symbol's shock.
-  const clearOneRes = await fetch(`${BASE}/api/dev/shock?symbol=SUZLON.NS`, { method: "DELETE" });
+  const clearOneRes = await fetch(`${BASE}/api/dev/shock?symbol=SUZLON.NS`, { method: "DELETE", headers: authHeaders });
   check("clearing one symbol's shock succeeds", clearOneRes.ok);
 
   const afterClearRes = await fetch(`${BASE}/api/watchlist`, { headers: authHeaders });
@@ -78,7 +84,7 @@ async function main() {
   // the underlying volatility/volume state didn't get corrupted.
   await fetch(`${BASE}/api/dev/shock`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: authHeaders,
     body: JSON.stringify({ symbol: "SUZLON.NS", priceOverridePct: 0.1 }),
   });
   const marketFeedRes = await fetch(`${BASE}/api/market-feed`);
@@ -89,7 +95,7 @@ async function main() {
     realQuote && Math.abs(realQuote.price - (shockedItem?.card?.currentPrice ?? 0)) > 0.01
   );
 
-  await fetch(`${BASE}/api/dev/shock`, { method: "DELETE" });
+  await fetch(`${BASE}/api/dev/shock`, { method: "DELETE", headers: authHeaders });
 
   // A simulated volume ratio below the app's own real-data threshold
   // (2.5x) must not be classified as an anomaly — found in review: the
@@ -97,14 +103,14 @@ async function main() {
   // `isAnomaly: true`, even 1.2x, contradicting the app's own definition.
   await fetch(`${BASE}/api/dev/shock`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: authHeaders,
     body: JSON.stringify({ symbol: "SUZLON.NS", volumeAnomalyRatio: 1.2 }),
   });
   const belowThresholdRes = await fetch(`${BASE}/api/watchlist`, { headers: authHeaders });
   const belowThresholdData = await belowThresholdRes.json();
   const belowThresholdItem = belowThresholdData.items.find((i: { symbol: string }) => i.symbol === "SUZLON.NS");
   check(
-    "a simulated 1.2x volume ratio (below the 2.5x threshold) is not classified as an anomaly",
+    "a simulated 1.2x volume ratio (below the 1.5x elevated threshold) is not classified as an anomaly",
     belowThresholdItem?.card?.isVolumeAnomaly === false
   );
 
@@ -112,12 +118,12 @@ async function main() {
   // found in review: -1.5 (-150%) produced a currentPrice of -1156.20.
   const negativePriceRes = await fetch(`${BASE}/api/dev/shock`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: authHeaders,
     body: JSON.stringify({ symbol: "SUZLON.NS", priceOverridePct: -1.5 }),
   });
   check("a priceOverridePct that would make price negative is rejected", negativePriceRes.status === 400);
 
-  await fetch(`${BASE}/api/dev/shock`, { method: "DELETE" });
+  await fetch(`${BASE}/api/dev/shock`, { method: "DELETE", headers: authHeaders });
   await fetch(`${BASE}/api/watchlist?symbol=SUZLON.NS`, { method: "DELETE", headers: authHeaders });
 
   console.log(failures === 0 ? "\nAll phase 5 smoke checks passed." : `\n${failures} check(s) failed.`);

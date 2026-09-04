@@ -1,8 +1,14 @@
 // Smoke test for Phase 3 — scoring engine. Pure logic, synthetic inputs,
-// no network/dev-server needed. Run with: npx tsx smoketests/phase3-engine.ts
+// no network/dev-server needed. Run with: npm run test:engine
+//
+// Every case pins an explicit `now` rather than using Date.now(). The engine
+// measures elapsed time in *trading* time, so "one hour ago" means something
+// different at 2pm on a Tuesday than at 2am on a Sunday — a test that reads
+// the wall clock would pass or fail depending on when it happened to run.
 
 import { scoreSymbol } from "../src/lib/scoring";
 import type { NSEQuote } from "../src/lib/marketData";
+import type { VolumeAnomalyResult } from "../src/lib/volumeAnomaly";
 
 let failures = 0;
 function check(name: string, condition: boolean) {
@@ -13,6 +19,15 @@ function check(name: string, condition: boolean) {
   }
 }
 
+// Fixed reference points, all real NSE session times (IST = UTC+5:30).
+// Fri 2026-09-04 and Mon 2026-09-07 are both ordinary trading days.
+const FRI_1400 = Date.parse("2026-09-04T08:30:00Z"); // Fri 2:00 PM IST, mid-session
+const FRI_1300 = Date.parse("2026-09-04T07:30:00Z"); // Fri 1:00 PM IST, same session
+const FRI_1530 = Date.parse("2026-09-04T10:00:00Z"); // Fri 3:30 PM IST, the close
+const THU_1800 = Date.parse("2026-09-03T12:30:00Z"); // Thu 6:00 PM IST, after close
+const FRI_0930 = Date.parse("2026-09-04T04:00:00Z"); // Fri 9:30 AM IST, just after the open
+const MON_0930 = Date.parse("2026-09-07T04:00:00Z"); // Mon 9:30 AM IST, just after the open
+
 function makeQuote(overrides: Partial<NSEQuote> = {}): NSEQuote {
   return {
     symbol: "TEST.NS",
@@ -22,79 +37,264 @@ function makeQuote(overrides: Partial<NSEQuote> = {}): NSEQuote {
     high52w: 150,
     low52w: 80,
     prevClose: 100,
-    sourceTimestamp: Date.now(),
+    sourceTimestamp: FRI_1400,
     ...overrides,
   };
 }
 
-const NO_VOLUME_SIGNAL = { isAnomaly: false, ratio: null, ratioClamped: false, isLive: true };
-const ONE_HOUR = 60 * 60 * 1000;
+/** A volume reading. `sustained` mirrors the tracker's "this surge held for consecutive polls" flag. */
+function volume(ratio: number | null, sustained = true): VolumeAnomalyResult {
+  return {
+    isAnomaly: ratio !== null && ratio >= 1.5,
+    level: ratio === null ? "NORMAL" : ratio >= 3 ? "SURGE" : ratio >= 1.5 ? "ELEVATED" : "NORMAL",
+    ratio,
+    sustained: sustained && ratio !== null && ratio >= 3,
+    ratioClamped: false,
+    isLive: true,
+  };
+}
+const NO_VOLUME_SIGNAL = volume(null);
 
 // Test 1: same raw % move, different volatility tiers -> different tiers.
+// This is the product's central claim, so it asserts the *tiers*, not just
+// that one z-score exceeds the other (which is arithmetically guaranteed
+// whenever sigma_low < sigma_high and so proved almost nothing).
 const move2pct = makeQuote({ price: 102, prevClose: 100 });
-const lastSeenOneHourAgo = { price: 100, timestamp: Date.now() - ONE_HOUR };
-
 const lowVolResult = scoreSymbol({
   quote: move2pct,
-  lastSeen: lastSeenOneHourAgo,
+  now: FRI_1400,
+  lastSeen: { price: 100, timestamp: FRI_1300 },
   volatility: { sigma: 0.008, isLive: true }, // low-vol blue chip, e.g. HDFCBANK-tier
   volumeAnomaly: NO_VOLUME_SIGNAL,
 });
 const highVolResult = scoreSymbol({
   quote: move2pct,
-  lastSeen: lastSeenOneHourAgo,
+  now: FRI_1400,
+  lastSeen: { price: 100, timestamp: FRI_1300 },
   volatility: { sigma: 0.038, isLive: true }, // high-vol name, e.g. ADANIENT-tier
   volumeAnomaly: NO_VOLUME_SIGNAL,
 });
-
 check(
-  `same 2% move scores higher tier on low-vol stock than high-vol stock (low=${lowVolResult.tier}, high=${highVolResult.tier})`,
-  ["CRITICAL", "NOTABLE"].includes(lowVolResult.tier) && highVolResult.tier !== lowVolResult.tier || (lowVolResult.zScore ?? 0) > (highVolResult.zScore ?? 0)
+  `same 2% move is CRITICAL on the low-vol stock and not on the high-vol one (low=${lowVolResult.tier}, high=${highVolResult.tier})`,
+  lowVolResult.tier === "CRITICAL" && highVolResult.tier !== "CRITICAL"
+);
+check(
+  `and the z-scores order the same way (low=${lowVolResult.zScore?.toFixed(2)}, high=${highVolResult.zScore?.toFixed(2)})`,
+  (lowVolResult.zScore ?? 0) > (highVolResult.zScore ?? 0)
 );
 
-// Test 2: volume anomaly alone (no meaningful price move) still flags.
+// Test 2: volume alone drives the tier, and does so proportionally.
+// An ELEVATED ratio is worth NOTABLE; a SURGE carries enough weight on its
+// own to reach CRITICAL without any price signal at all.
 const flatPriceQuote = makeQuote({ price: 100.05, prevClose: 100 });
-const volumeOnlyResult = scoreSymbol({
+const scoreVolumeOnly = (ratio: number) =>
+  scoreSymbol({
+    quote: flatPriceQuote,
+    now: FRI_1400,
+    lastSeen: { price: 100, timestamp: FRI_1300 },
+    volatility: { sigma: 0.02, isLive: true },
+    volumeAnomaly: volume(ratio),
+  });
+
+const volNormal = scoreVolumeOnly(1.2);
+const volElevated = scoreVolumeOnly(2.0);
+const volSurge = scoreVolumeOnly(4.2);
+
+check(`volume below 1.5x on a flat price stays QUIET (got ${volNormal.tier})`, volNormal.tier === "QUIET");
+check(`volume at 2.0x on a flat price is NOTABLE (got ${volElevated.tier})`, volElevated.tier === "NOTABLE");
+check(`volume at 4.2x on a flat price escalates all the way to CRITICAL (got ${volSurge.tier})`, volSurge.tier === "CRITICAL");
+check("volume anomaly reason surfaces in primary or secondary", volSurge.primaryReason.includes("Volume"));
+check("a surge is described as a surge, not just a multiple", volSurge.primaryReason.includes("surged"));
+
+// Test 2a: a surge that has only printed once is NOT yet worth CRITICAL.
+// NSE volume is U-shaped, so a single 20-second print at 3x+ is routine into
+// the close; without the confirmation requirement the whole list turns red
+// every afternoon (observed live against the real feed).
+const unconfirmedSurge = scoreSymbol({
   quote: flatPriceQuote,
-  lastSeen: { price: 100, timestamp: Date.now() - ONE_HOUR },
+  now: FRI_1400,
+  lastSeen: { price: 100, timestamp: FRI_1300 },
   volatility: { sigma: 0.02, isLive: true },
-  volumeAnomaly: { isAnomaly: true, ratio: 4.2, ratioClamped: false, isLive: true },
+  volumeAnomaly: volume(4.2, false),
 });
 check(
-  `volume anomaly alone (flat price) still escalates tier (got ${volumeOnlyResult.tier})`,
-  volumeOnlyResult.tier !== "QUIET"
+  `a 4.2x surge on its first poll is NOTABLE, not CRITICAL (got ${unconfirmedSurge.tier})`,
+  unconfirmedSurge.tier === "NOTABLE"
 );
-check("volume anomaly reason surfaces in primary or secondary", volumeOnlyResult.primaryReason.includes("Volume") || volumeOnlyResult.secondaryReasons.some((r) => r.includes("Volume")));
+check(
+  "...and only the confirmed one reaches CRITICAL",
+  volSurge.tier === "CRITICAL" && volSurge.primaryReason.includes("holding")
+);
+
+// Test 2b: rising volume escalates monotonically — more volume is never a
+// weaker signal than less.
+const tierRank = { QUIET: 0, NEW: 0, NOTABLE: 1, CRITICAL: 2 };
+check(
+  "tier is monotonic in volume ratio (1.2x -> 2.0x -> 4.2x never goes backwards)",
+  tierRank[volNormal.tier] <= tierRank[volElevated.tier] && tierRank[volElevated.tier] <= tierRank[volSurge.tier]
+);
+
+// Test 2c: volume corroborating a price move still escalates, exactly as two
+// independent signals always did — the added weight must not have weakened
+// any combination that used to escalate.
+const priceAndVolume = scoreSymbol({
+  quote: makeQuote({ price: 101.4, prevClose: 100 }),
+  now: FRI_1400,
+  lastSeen: { price: 100, timestamp: FRI_1300 },
+  volatility: { sigma: 0.02, isLive: true },
+  volumeAnomaly: volume(1.8),
+});
+check(
+  `a NOTABLE price move plus merely elevated volume still escalates to CRITICAL (got ${priceAndVolume.tier})`,
+  priceAndVolume.tier === "CRITICAL"
+);
 
 // Test 3: level break triggers regardless of small price move.
 const levelBreakQuote = makeQuote({ price: 150.5, high52w: 150, prevClose: 150.2 });
 const levelBreakResult = scoreSymbol({
   quote: levelBreakQuote,
-  lastSeen: { price: 150.2, timestamp: Date.now() - ONE_HOUR },
+  now: FRI_1400,
+  lastSeen: { price: 150.2, timestamp: FRI_1300 },
   volatility: { sigma: 0.02, isLive: true },
   volumeAnomaly: NO_VOLUME_SIGNAL,
 });
 check(`52-week high break flags isLevelBreak`, levelBreakResult.isLevelBreak === true);
 check(`52-week high break escalates tier (got ${levelBreakResult.tier})`, levelBreakResult.tier !== "QUIET");
 
-// Test 4: same % move, longer elapsed time since last seen -> lower z-score
-// (a big move is less surprising the longer you've been away).
-const sameMoveQuote = makeQuote({ price: 105, prevClose: 100 });
-const shortElapsed = scoreSymbol({
-  quote: sameMoveQuote,
-  lastSeen: { price: 100, timestamp: Date.now() - 5 * 60 * 1000 }, // 5 min ago
-  volatility: { sigma: 0.02, isLive: true },
-  volumeAnomaly: NO_VOLUME_SIGNAL,
-});
-const longElapsed = scoreSymbol({
-  quote: sameMoveQuote,
-  lastSeen: { price: 100, timestamp: Date.now() - 3 * 24 * 60 * 60 * 1000 }, // 3 days ago
+// Test 3b: a level break the user already acknowledged is no longer news.
+// Without this, a stock sitting at its 52-week high stays flagged forever
+// however many times "mark all as seen" is clicked, and the "N need your
+// attention" headline can never reach zero.
+const acknowledgedLevelBreak = scoreSymbol({
+  quote: levelBreakQuote,
+  now: FRI_1400,
+  lastSeen: { price: 150.2, timestamp: FRI_1300, levelBreak: true },
   volatility: { sigma: 0.02, isLive: true },
   volumeAnomaly: NO_VOLUME_SIGNAL,
 });
 check(
-  `same 5% move scores a higher z-score after 5 minutes (${shortElapsed.zScore?.toFixed(2)}) than after 3 days (${longElapsed.zScore?.toFixed(2)})`,
+  `an already-acknowledged 52-week high does not re-flag (got ${acknowledgedLevelBreak.tier})`,
+  acknowledgedLevelBreak.tier === "QUIET"
+);
+check(
+  "but the fact is still shown as context rather than silently dropped",
+  acknowledgedLevelBreak.isLevelBreak === true &&
+    acknowledgedLevelBreak.secondaryReasons.some((r) => r.includes("already seen"))
+);
+
+// Test 3c: same rule for volume, with a margin — an acknowledged surge stops
+// flagging, but a materially bigger one starts again.
+const surgeQuote = makeQuote({ price: 100.05, prevClose: 100 });
+const acknowledgedSurge = scoreSymbol({
+  quote: surgeQuote,
+  now: FRI_1400,
+  lastSeen: { price: 100, timestamp: FRI_1300, volumeRatio: 4.2 },
+  volatility: { sigma: 0.02, isLive: true },
+  volumeAnomaly: volume(4.2),
+});
+check(`an already-acknowledged volume surge does not re-flag (got ${acknowledgedSurge.tier})`, acknowledgedSurge.tier === "QUIET");
+
+const escalatingSurge = scoreSymbol({
+  quote: surgeQuote,
+  now: FRI_1400,
+  lastSeen: { price: 100, timestamp: FRI_1300, volumeRatio: 4.2 },
+  volatility: { sigma: 0.02, isLive: true },
+  volumeAnomaly: volume(7.0),
+});
+check(
+  `volume climbing well past what was acknowledged flags again (got ${escalatingSurge.tier})`,
+  escalatingSurge.tier === "CRITICAL"
+);
+
+// Test 4: elapsed time is TRADING time, not wall-clock. This is the case the
+// product is named after and the one the old wall-clock model got wrong: a
+// real 5% gap across a weekend scored 0.57σ -> QUIET -> "no notable activity
+// since last check."
+const gap5pct = makeQuote({ price: 105, prevClose: 100, sourceTimestamp: MON_0930 });
+const BAJFINANCE_SIGMA = 0.027;
+
+const weekendGap = scoreSymbol({
+  quote: gap5pct,
+  now: MON_0930,
+  lastSeen: { price: 100, timestamp: FRI_1530 }, // checked at Friday's close
+  volatility: { sigma: BAJFINANCE_SIGMA, isLive: true },
+  volumeAnomaly: NO_VOLUME_SIGNAL,
+});
+check(
+  `a real 5% gap over a weekend is CRITICAL, not QUIET (got ${weekendGap.tier} at ${weekendGap.zScore?.toFixed(2)}σ)`,
+  weekendGap.tier === "CRITICAL"
+);
+check(
+  `the weekend contributes ~zero trading minutes (got ${Math.round(weekendGap.tradingElapsedMs! / 60000)} min)`,
+  weekendGap.tradingElapsedMs! < 20 * 60 * 1000
+);
+check(`and the card reports the market open that was missed (got ${weekendGap.sessionsMissed})`, weekendGap.sessionsMissed === 1);
+
+// One night, not a night plus a full session: Thursday evening to Friday
+// morning. (Thursday evening to *Monday* morning contains an entire extra
+// Friday session, so 5% over that span is genuinely NOTABLE rather than
+// CRITICAL — a distinction the old wall-clock model could not make at all.)
+const overnightGap = scoreSymbol({
+  quote: makeQuote({ price: 105, prevClose: 100, sourceTimestamp: FRI_0930 }),
+  now: FRI_0930,
+  lastSeen: { price: 100, timestamp: THU_1800 }, // checked Thursday evening
+  volatility: { sigma: BAJFINANCE_SIGMA, isLive: true },
+  volumeAnomaly: NO_VOLUME_SIGNAL,
+});
+check(
+  `a real 5% overnight gap is CRITICAL, not QUIET (got ${overnightGap.tier} at ${overnightGap.zScore?.toFixed(2)}σ)`,
+  overnightGap.tier === "CRITICAL"
+);
+
+// The counterpart: the same 5% spread over an extra full trading session is
+// less surprising, and the engine should say so rather than flattening both
+// into one answer.
+const gapPlusFullSession = scoreSymbol({
+  quote: makeQuote({ price: 105, prevClose: 100, sourceTimestamp: MON_0930 }),
+  now: MON_0930,
+  lastSeen: { price: 100, timestamp: THU_1800 },
+  volatility: { sigma: BAJFINANCE_SIGMA, isLive: true },
+  volumeAnomaly: NO_VOLUME_SIGNAL,
+});
+check(
+  `the same 5% across an extra full session is ranked below the overnight gap (${gapPlusFullSession.zScore?.toFixed(2)}σ vs ${overnightGap.zScore?.toFixed(2)}σ)`,
+  (gapPlusFullSession.zScore ?? 0) < (overnightGap.zScore ?? 0) && gapPlusFullSession.tier !== "QUIET"
+);
+
+// ...and the original monotonicity property still holds within a session.
+const shortElapsed = scoreSymbol({
+  quote: makeQuote({ price: 105, prevClose: 100 }),
+  now: FRI_1400,
+  lastSeen: { price: 100, timestamp: FRI_1400 - 5 * 60 * 1000 },
+  volatility: { sigma: 0.02, isLive: true },
+  volumeAnomaly: NO_VOLUME_SIGNAL,
+});
+const longElapsed = scoreSymbol({
+  quote: makeQuote({ price: 105, prevClose: 100 }),
+  now: FRI_1400,
+  lastSeen: { price: 100, timestamp: FRI_1400 - 3 * 24 * 60 * 60 * 1000 },
+  volatility: { sigma: 0.02, isLive: true },
+  volumeAnomaly: NO_VOLUME_SIGNAL,
+});
+check(
+  `same 5% move still scores higher after 5 minutes (${shortElapsed.zScore?.toFixed(2)}) than after 3 days (${longElapsed.zScore?.toFixed(2)})`,
   (shortElapsed.zScore ?? 0) > (longElapsed.zScore ?? 0)
+);
+
+// Test 4b: an ordinary opening tick after an overnight gap must NOT be
+// alarming. This is the guard on the fix itself — charging a closed session
+// zero variance would make ~1 minute of elapsed trading time the denominator
+// and turn every normal 0.4% opening move into a double-digit sigma event.
+const ordinaryOpen = scoreSymbol({
+  quote: makeQuote({ price: 100.4, prevClose: 100, sourceTimestamp: MON_0930 }),
+  now: MON_0930,
+  lastSeen: { price: 100, timestamp: FRI_1530 },
+  volatility: { sigma: BAJFINANCE_SIGMA, isLive: true },
+  volumeAnomaly: NO_VOLUME_SIGNAL,
+});
+check(
+  `an ordinary 0.4% move across a weekend stays QUIET (got ${ordinaryOpen.tier} at ${ordinaryOpen.zScore?.toFixed(2)}σ)`,
+  ordinaryOpen.tier === "QUIET"
 );
 
 // Test 5: a symbol with NO last-seen snapshot (just added to the
@@ -104,6 +304,7 @@ check(
 const freshAddQuote = makeQuote({ price: 1330.3, prevClose: 1302.5, changePct: 2.13, high52w: 1600, low52w: 1100 });
 const freshAddResult = scoreSymbol({
   quote: freshAddQuote,
+  now: FRI_1400,
   lastSeen: null,
   volatility: { sigma: 0.016, isLive: false },
   volumeAnomaly: NO_VOLUME_SIGNAL,
@@ -116,15 +317,16 @@ check(`NEW tier has the baseline-created message`, freshAddResult.primaryReason 
 // level-break AND a real volume anomaly at the same time — this is the
 // exact scenario a judge could hit: add a stock that happens to be at its
 // 52-week high with unusual volume right now, and the two real, independent
-// signals used to combine via the same 2-signal escalation rule that
-// applies once there's a baseline, producing a false CRITICAL on a stock
-// with zero "since you checked" history. NEW must never escalate.
+// signals used to combine via the same escalation rule that applies once
+// there's a baseline, producing a false CRITICAL on a stock with zero
+// "since you checked" history. NEW must never escalate.
 const activeNewStockQuote = makeQuote({ price: 150, prevClose: 148, high52w: 150, low52w: 80 });
 const activeNewStockResult = scoreSymbol({
   quote: activeNewStockQuote,
+  now: FRI_1400,
   lastSeen: null,
   volatility: { sigma: 0.02, isLive: true },
-  volumeAnomaly: { isAnomaly: true, ratio: 5.0, ratioClamped: false, isLive: true },
+  volumeAnomaly: volume(5.0),
 });
 check(
   `a never-seen stock at its 52-week high WITH a volume spike is still NEW, not escalated (got ${activeNewStockResult.tier})`,
@@ -144,9 +346,10 @@ check(
 const nearInstantQuote = makeQuote({ price: 993.06, prevClose: 1059 });
 const nearInstantResult = scoreSymbol({
   quote: nearInstantQuote,
-  lastSeen: { price: 1059, timestamp: Date.now() - 1000 }, // 1 second ago
-  volatility: { sigma: 0.027, isLive: true }, // BAJFINANCE.NS-tier sigma
-  volumeAnomaly: { isAnomaly: true, ratio: 4.1, ratioClamped: false, isLive: true },
+  now: FRI_1400,
+  lastSeen: { price: 1059, timestamp: FRI_1400 - 1000 },
+  volatility: { sigma: BAJFINANCE_SIGMA, isLive: true },
+  volumeAnomaly: volume(4.1),
 });
 check(
   `a large move 1 second after mark-seen never displays an absurd z-score (got ${nearInstantResult.zScore})`,
@@ -169,6 +372,7 @@ check(
 const shockedNeverSeenQuote = makeQuote({ price: 1220, prevClose: 1300, changePct: 1.9, high52w: 1600, low52w: 1100 });
 const shockedNeverSeenResult = scoreSymbol({
   quote: shockedNeverSeenQuote,
+  now: FRI_1400,
   lastSeen: null,
   volatility: { sigma: 0.016, isLive: false },
   volumeAnomaly: NO_VOLUME_SIGNAL,
@@ -185,11 +389,19 @@ check(
 const missingBoundsQuote = makeQuote({ price: 500, prevClose: 495, high52w: null, low52w: null });
 const missingBoundsResult = scoreSymbol({
   quote: missingBoundsQuote,
-  lastSeen: { price: 495, timestamp: Date.now() - ONE_HOUR },
+  now: FRI_1400,
+  lastSeen: { price: 495, timestamp: FRI_1300 },
   volatility: { sigma: 0.02, isLive: true },
   volumeAnomaly: NO_VOLUME_SIGNAL,
 });
 check("missing 52-week bounds never register as a level break", missingBoundsResult.isLevelBreak === false);
+
+// Test 9: the card carries the baseline it diffed against, so the UI can
+// actually render "₹1,240 → ₹1,310" instead of leaving the "from" implicit.
+check(
+  `the card reports the last-seen price it diffed against (got ${weekendGap.lastSeenPrice})`,
+  weekendGap.lastSeenPrice === 100 && weekendGap.lastSeenAt === FRI_1530
+);
 
 console.log(failures === 0 ? "\nAll phase 3 smoke checks passed." : `\n${failures} check(s) failed.`);
 process.exit(failures === 0 ? 0 : 1);

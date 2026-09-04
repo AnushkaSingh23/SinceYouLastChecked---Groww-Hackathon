@@ -52,7 +52,12 @@ function closeAt(timestamps: number[], closes: number[], targetMs: number): numb
 
 async function fetchTrend(symbol: string): Promise<LongTermTrend | null> {
   try {
-    const res = await fetch(HISTORY_URL(symbol), { headers: { "User-Agent": BROWSER_UA } });
+    const res = await fetch(HISTORY_URL(symbol), {
+      headers: { "User-Agent": BROWSER_UA },
+      // Same reasoning as marketData.ts: this runs inside a request path, so
+      // a stalled socket would hold a watchlist render open indefinitely.
+      signal: AbortSignal.timeout(8_000),
+    });
     if (!res.ok) return null;
 
     const data = await res.json();

@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { NSE_40_UNIVERSE } from "@/lib/nseUniverse";
 // Import the card shape from where it's actually defined instead of
 // hand-duplicating it here — a hand-copied interface already drifted once
@@ -15,6 +15,7 @@ import type { LongTermTrend } from "@/lib/longTermTrend";
 interface WatchlistItemData {
   symbol: string;
   name: string;
+  sector: string | null;
   addedAt: string;
   lastSeenAt: string | null;
   card: AttentionCard | null;
@@ -28,20 +29,97 @@ interface MarketStatus {
   nextSessionText: string;
 }
 
+interface FeedHealth {
+  lastSuccessfulPollAt: number | null;
+  lastPollAt: number | null;
+  consecutiveFailures: number;
+  symbolsResolved: number;
+  symbolsAttempted: number;
+  degraded: boolean;
+}
+
 interface WatchlistResponse {
   marketStatus: MarketStatus;
   lastPollAt: number | null;
+  feedHealth: FeedHealth;
   items: WatchlistItemData[];
 }
 
-// One config per tier instead of two separate Records that have to be kept
-// in sync by hand (they'd drifted in key order already — see review notes).
-const TIER_CONFIG: Record<Tier, { card: string; badge: string; rank: number }> = {
-  CRITICAL: { card: "border-red-500/60 bg-red-500/10", badge: "bg-red-500 text-white", rank: 2 },
-  NOTABLE: { card: "border-amber-500/60 bg-amber-500/10", badge: "bg-amber-500 text-black", rank: 1 },
-  NEW: { card: "border-sky-700/60 bg-sky-500/10", badge: "bg-sky-600 text-white", rank: 0 },
-  QUIET: { card: "border-neutral-800 bg-neutral-900/20 opacity-70", badge: "bg-neutral-700 text-neutral-200", rank: 0 },
+// ---------------------------------------------------------------------------
+// Formatting
+//
+// Everything money- and time-shaped goes through one of these. Prices used to
+// render as ₹142850.00 with no Indian digit grouping, and timestamps used the
+// en-IN *format* without the IST *zone* — so a reviewer abroad saw an
+// Indian-styled time that wasn't IST, in an app whose every other surface
+// (market hours, session text, ₹) is IST-anchored.
+// ---------------------------------------------------------------------------
+
+const INR = new Intl.NumberFormat("en-IN", {
+  style: "currency",
+  currency: "INR",
+  minimumFractionDigits: 2,
+  maximumFractionDigits: 2,
+});
+const formatINR = (n: number) => INR.format(n);
+
+const IST_CLOCK = new Intl.DateTimeFormat("en-IN", {
+  timeZone: "Asia/Kolkata",
+  hour: "numeric",
+  minute: "2-digit",
+  hour12: true,
+});
+const IST_DAY_CLOCK = new Intl.DateTimeFormat("en-IN", {
+  timeZone: "Asia/Kolkata",
+  weekday: "short",
+  hour: "numeric",
+  minute: "2-digit",
+  hour12: true,
+});
+
+/** Coarse "how long ago", with hour and day rollover — a raw minutes figure renders as "4020m" over a weekend. */
+function relativeTime(fromMs: number, nowMs: number): string {
+  const sec = Math.max(0, Math.round((nowMs - fromMs) / 1000));
+  if (sec < 90) return "just now";
+  const min = Math.round(sec / 60);
+  if (min < 60) return `${min} min ago`;
+  const hr = Math.round(min / 60);
+  if (hr < 24) return `${hr} hr ago`;
+  const days = Math.round(hr / 24);
+  return days === 1 ? "1 day ago" : `${days} days ago`;
+}
+
+/** Same rollover problem, shorter form, for the per-card data-age line. */
+function formatAge(sec: number): string {
+  if (sec < 60) return `${sec}s`;
+  if (sec < 3600) return `${Math.round(sec / 60)}m`;
+  if (sec < 86_400) return `${Math.round(sec / 3600)}h`;
+  return `${Math.round(sec / 86_400)}d`;
+}
+
+// Tier styling. Each tier carries a glyph as well as a colour so the signal
+// isn't encoded by colour alone, and every value here reads correctly in both
+// light and dark mode (the `/N` alpha backgrounds sit on --surface, and the
+// solid badge colours carry their own contrasting foreground).
+const TIER_CONFIG: Record<Tier, { card: string; badge: string; glyph: string; rank: number }> = {
+  CRITICAL: { card: "border-red-500 bg-red-500/10", badge: "bg-red-600 text-white", glyph: "▲", rank: 2 },
+  NOTABLE: { card: "border-amber-500 bg-amber-500/10", badge: "bg-amber-500 text-black", glyph: "●", rank: 1 },
+  NEW: { card: "border-sky-500/70 bg-sky-500/10", badge: "bg-sky-600 text-white", glyph: "✦", rank: 0 },
+  QUIET: { card: "border-line bg-surface", badge: "bg-surface-muted text-fg-muted", glyph: "–", rank: 0 },
 };
+
+type TabId = "ALL" | "ATTENTION" | "NEW" | "QUIET";
+
+// "All" stays the default and renders exactly the stacked, priority-sorted
+// view the app has always had — the tabs narrow it, they don't replace it.
+// That matters: landing on a filtered tab that happens to be empty would hide
+// the fact that everything is fine, which is itself the answer most days.
+const TABS: { id: TabId; label: string }[] = [
+  { id: "ALL", label: "All" },
+  { id: "ATTENTION", label: "Needs attention" },
+  { id: "NEW", label: "New" },
+  { id: "QUIET", label: "Unchanged" },
+];
 
 // Dev/demo presets — NSE is only live ~6 hours total across this hackathon's
 // window, so this is how CRITICAL/NOTABLE states get demonstrated on demand
@@ -75,7 +153,12 @@ function useIdentity() {
     return d;
   }, []);
 
-  return { handle, identify };
+  const signOut = useCallback(async () => {
+    await fetch("/api/identity", { method: "DELETE" });
+    setHandle(null);
+  }, []);
+
+  return { handle, identify, signOut };
 }
 
 function IdentityGate({ onIdentify }: { onIdentify: (name: string) => Promise<unknown> }) {
@@ -85,9 +168,19 @@ function IdentityGate({ onIdentify }: { onIdentify: (name: string) => Promise<un
   return (
     <div className="mx-auto mt-24 max-w-sm px-4 text-center">
       <h1 className="text-xl font-semibold">Since You Last Checked</h1>
-      <p className="mt-2 text-sm text-neutral-400">
+      <p className="mt-1 text-sm text-fg-muted">
+        A smart NSE watchlist that surfaces what actually changed while you were away.
+      </p>
+      <p className="mt-4 text-sm text-fg-muted">
         Enter a name to create or return to your watchlist. No password — the same name on any
         device brings back the same watchlist.
+      </p>
+      {/* Said plainly rather than left to be discovered. The no-password
+          design is a deliberate trade-off (see README), but a reader who
+          assumes their list is private is being misled by omission. */}
+      <p className="mt-2 text-xs text-fg-faint">
+        There&rsquo;s no password, so this isn&rsquo;t private — anyone who enters the same name
+        sees the same watchlist. Use a name you don&rsquo;t mind sharing.
       </p>
       <form
         className="mt-6 flex gap-2"
@@ -99,8 +192,12 @@ function IdentityGate({ onIdentify }: { onIdentify: (name: string) => Promise<un
           setBusy(false);
         }}
       >
+        <label htmlFor="handle" className="sr-only">
+          Your name
+        </label>
         <input
-          className="flex-1 rounded border border-neutral-700 bg-neutral-900 px-3 py-2 text-sm outline-none focus:border-neutral-400"
+          id="handle"
+          className="flex-1 rounded border border-line-strong bg-surface px-3 py-2 text-sm text-fg outline-none focus:border-fg-muted"
           placeholder="e.g. anushka"
           value={name}
           onChange={(e) => setName(e.target.value)}
@@ -108,7 +205,7 @@ function IdentityGate({ onIdentify }: { onIdentify: (name: string) => Promise<un
         <button
           type="submit"
           disabled={busy}
-          className="rounded bg-neutral-100 px-4 py-2 text-sm font-medium text-black disabled:opacity-50"
+          className="rounded bg-btn px-4 py-2 text-sm font-medium text-btn-fg disabled:opacity-50"
         >
           {busy ? "..." : "Continue"}
         </button>
@@ -118,19 +215,19 @@ function IdentityGate({ onIdentify }: { onIdentify: (name: string) => Promise<un
 }
 
 const TREND_LABEL_STYLE: Record<LongTermTrend["label"], string> = {
-  Upward: "text-emerald-400",
-  Downward: "text-red-400",
-  Mixed: "text-neutral-400",
+  Upward: "text-pos",
+  Downward: "text-neg",
+  Mixed: "text-fg-muted",
 };
 
 function TrendStat({ label, pct }: { label: string; pct: number | null }) {
   return (
     <div className="flex flex-col items-center">
-      <span className="text-neutral-600">{label}</span>
+      <span className="text-fg-faint">{label}</span>
       {pct === null ? (
-        <span className="text-neutral-700">—</span>
+        <span className="text-fg-faint">—</span>
       ) : (
-        <span className={pct >= 0 ? "text-emerald-400" : "text-red-400"}>
+        <span className={pct >= 0 ? "text-pos" : "text-neg"}>
           {pct >= 0 ? "+" : ""}
           {(pct * 100).toFixed(1)}%
         </span>
@@ -145,9 +242,9 @@ function TrendStat({ label, pct }: { label: string; pct: number | null }) {
 function TrendSection({ trend }: { trend: LongTermTrend | null }) {
   if (!trend) return null;
   return (
-    <div className="mt-3 border-t border-neutral-800 pt-3">
+    <div className="mt-3 border-t border-line pt-3">
       <div className="mb-1.5 flex items-center justify-between">
-        <span className="text-[11px] uppercase tracking-wide text-neutral-600">Longer-Term Trend</span>
+        <span className="text-[11px] uppercase tracking-wide text-fg-faint">Longer-Term Trend</span>
         <span className={`text-[11px] font-medium ${TREND_LABEL_STYLE[trend.label]}`}>{trend.label}</span>
       </div>
       <div className="flex justify-between text-xs">
@@ -160,45 +257,81 @@ function TrendSection({ trend }: { trend: LongTermTrend | null }) {
   );
 }
 
-function MarketStatusBanner({ status, lastPollAt }: { status: MarketStatus; lastPollAt: number | null }) {
+function MarketStatusBanner({
+  status,
+  lastPollAt,
+  feedHealth,
+}: {
+  status: MarketStatus;
+  lastPollAt: number | null;
+  feedHealth: FeedHealth | undefined;
+}) {
+  // Only ever claim a freshness time we actually have data for. The banner
+  // used to print the time of the last *attempt*, so it stayed confident
+  // while every symbol was failing — contradicting the per-card age line.
+  const asOf = lastPollAt ? `data as of ${IST_CLOCK.format(new Date(lastPollAt))} IST` : "waiting for first quote";
+
   return (
-    <div className="flex items-center justify-between rounded border border-neutral-800 bg-neutral-900/60 px-4 py-2 text-sm">
-      <span className={status.isOpen ? "text-emerald-400" : "text-neutral-400"}>
-        {status.isOpen ? "● " : "○ "}
-        {status.statusText}
-      </span>
-      <span className="text-neutral-500">
-        {status.nextSessionText}
-        {lastPollAt ? ` · data as of ${new Date(lastPollAt).toLocaleTimeString("en-IN")}` : ""}
-      </span>
+    <div className="rounded border border-line bg-surface px-4 py-2 text-sm">
+      <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1">
+        <span className={status.isOpen ? "text-pos" : "text-fg-muted"}>
+          {status.isOpen ? "● " : "○ "}
+          {status.statusText}
+        </span>
+        <span className="text-fg-muted">
+          {status.nextSessionText} · {asOf}
+        </span>
+      </div>
+      {feedHealth?.degraded && (
+        <p className="mt-1 text-xs text-neg">
+          Live feed unavailable ({feedHealth.consecutiveFailures} failed{" "}
+          {feedHealth.consecutiveFailures === 1 ? "cycle" : "cycles"}) — showing last known prices.
+        </p>
+      )}
     </div>
   );
 }
 
 function Card({
   item,
+  now,
   onRemove,
+  onMarkSeen,
   onSimulate,
   onClearSimulation,
 }: {
   item: WatchlistItemData;
+  now: number;
   onRemove: (symbol: string) => void;
+  onMarkSeen: (symbol: string) => void;
   onSimulate: (symbol: string) => void;
   onClearSimulation: (symbol: string) => void;
 }) {
   const c = item.card;
   const tier: Tier = c?.tier ?? "QUIET";
+  const cfg = TIER_CONFIG[tier];
+  const lastSeenMs = item.lastSeenAt ? new Date(item.lastSeenAt).getTime() : null;
 
   return (
-    <div className={`rounded-lg border p-4 ${TIER_CONFIG[tier].card}`}>
+    <div className={`rounded-lg border p-4 ${cfg.card}`}>
       <div className="flex items-start justify-between gap-2">
         <div>
           <div className="font-medium">{item.name}</div>
-          <div className="text-xs text-neutral-500">{item.symbol}</div>
+          <div className="text-xs text-fg-faint">
+            {item.symbol}
+            {item.sector ? ` · ${item.sector}` : ""}
+          </div>
         </div>
         <div className="flex items-center gap-2">
-          <span className={`rounded px-2 py-0.5 text-xs font-semibold ${TIER_CONFIG[tier].badge}`}>{tier}</span>
-          <button onClick={() => onRemove(item.symbol)} className="text-xs text-neutral-500 hover:text-neutral-300">
+          <span className={`rounded px-2 py-0.5 text-xs font-semibold ${cfg.badge}`}>
+            <span aria-hidden="true">{cfg.glyph} </span>
+            {tier}
+          </span>
+          <button
+            onClick={() => onRemove(item.symbol)}
+            aria-label={`Remove ${item.name} from watchlist`}
+            className="text-xs text-fg-faint hover:text-fg"
+          >
             remove
           </button>
         </div>
@@ -206,66 +339,249 @@ function Card({
 
       {c ? (
         <>
-          <div className="mt-3 flex items-baseline gap-2">
-            <span className="text-lg font-semibold">₹{c.currentPrice.toFixed(2)}</span>
-            <span className={c.priceChangePct >= 0 ? "text-emerald-400" : "text-red-400"}>
+          <div className="mt-3 flex flex-wrap items-baseline gap-x-2 gap-y-1">
+            <span className="text-lg font-semibold">{formatINR(c.currentPrice)}</span>
+            <span className={c.priceChangePct >= 0 ? "text-pos" : "text-neg"}>
               {c.priceChangePct >= 0 ? "+" : ""}
               {(c.priceChangePct * 100).toFixed(2)}%
             </span>
-            <span className="text-xs text-neutral-500">
-              ({c.priceChangeAbs >= 0 ? "+" : "-"}₹{Math.abs(c.priceChangeAbs).toFixed(2)})
+            <span className="text-xs text-fg-muted">
+              ({c.priceChangeAbs >= 0 ? "+" : "−"}
+              {formatINR(Math.abs(c.priceChangeAbs))})
             </span>
             {c.isSimulated && (
-              <span className="rounded bg-violet-500/20 px-1.5 py-0.5 text-[10px] font-medium text-violet-300">
+              <span className="rounded bg-accent/15 px-1.5 py-0.5 text-[10px] font-medium text-accent">
                 SIMULATED
               </span>
             )}
           </div>
-          <p className="mt-2 text-sm text-neutral-300">{c.primaryReason}</p>
-          {c.newsHeadline && <p className="mt-1 text-xs italic text-violet-300">&ldquo;{c.newsHeadline}&rdquo;</p>}
+
+          {/* The diff the app is named after. Showing only the current price
+              and a % left the "from" — the whole premise — implicit. */}
+          {c.lastSeenPrice !== null && lastSeenMs !== null ? (
+            <p className="mt-1 text-xs text-fg-muted">
+              {formatINR(c.lastSeenPrice)} → {formatINR(c.currentPrice)} · last checked{" "}
+              {IST_DAY_CLOCK.format(new Date(lastSeenMs))} IST ({relativeTime(lastSeenMs, now)})
+              {c.sessionsMissed > 0 &&
+                ` · ${c.sessionsMissed} market ${c.sessionsMissed === 1 ? "open" : "opens"} since`}
+            </p>
+          ) : (
+            <p className="mt-1 text-xs text-fg-faint">
+              Not checked yet — change shown against yesterday&rsquo;s close.
+            </p>
+          )}
+
+          <p className="mt-2 text-sm text-fg">{c.primaryReason}</p>
+          {c.newsHeadline && <p className="mt-1 text-xs italic text-accent">&ldquo;{c.newsHeadline}&rdquo;</p>}
           {c.secondaryReasons.map((r) => (
             // Content itself as the key, not the array index — which
             // signal lands at which index can change between polls
             // depending on which conditions fire, so an index key risks
             // React reusing the wrong DOM node across a re-render.
-            <p key={r} className="text-xs text-neutral-500">
+            <p key={r} className="text-xs text-fg-muted">
               {r}
             </p>
           ))}
-          <div className="mt-3 flex items-center justify-between text-xs text-neutral-600">
+
+          <div className="mt-3 flex flex-wrap items-center justify-between gap-x-3 gap-y-1 text-xs text-fg-faint">
             <span>
               {c.volatilityIsLive ? "live volatility" : "seed volatility (warming up)"} · data{" "}
-              {c.dataFreshnessSec < 60 ? `${c.dataFreshnessSec}s` : `${Math.round(c.dataFreshnessSec / 60)}m`} old
+              {formatAge(c.dataFreshnessSec)} old
             </span>
-            {c.isSimulated ? (
-              <button onClick={() => onClearSimulation(item.symbol)} className="text-violet-400 hover:text-violet-300">
-                clear simulation
-              </button>
-            ) : (
-              <button onClick={() => onSimulate(item.symbol)} className="text-neutral-500 hover:text-neutral-300">
-                ⚡ simulate event
-              </button>
-            )}
+            <span className="flex items-center gap-3">
+              {tier !== "QUIET" && (
+                <button
+                  onClick={() => onMarkSeen(item.symbol)}
+                  aria-label={`Mark ${item.name} as seen`}
+                  className="text-fg-muted hover:text-fg"
+                >
+                  got it
+                </button>
+              )}
+              {c.isSimulated ? (
+                <button
+                  onClick={() => onClearSimulation(item.symbol)}
+                  aria-label={`Clear the simulated event on ${item.name}`}
+                  className="text-accent hover:underline"
+                >
+                  clear simulation
+                </button>
+              ) : (
+                <button
+                  onClick={() => onSimulate(item.symbol)}
+                  aria-label={`Simulate a market event on ${item.name}`}
+                  className="text-fg-muted hover:text-fg"
+                >
+                  ⚡ simulate event
+                </button>
+              )}
+            </span>
           </div>
           <TrendSection trend={item.trend} />
         </>
       ) : (
-        <p className="mt-3 text-sm text-neutral-500">Waiting for first live quote…</p>
+        <p className="mt-3 text-sm text-fg-muted">Waiting for first live quote…</p>
+      )}
+    </div>
+  );
+}
+
+/**
+ * Type-to-search combobox. Replaces a search box that only filtered a
+ * separate <select> — two controls, two steps, and an "Add" button that
+ * could stay enabled for a symbol the filter had just hidden.
+ */
+function AddStock({
+  available,
+  onAdd,
+}: {
+  available: { symbol: string; name: string; sector: string }[];
+  onAdd: (symbol: string) => Promise<void>;
+}) {
+  const [query, setQuery] = useState("");
+  const [open, setOpen] = useState(false);
+  const [highlight, setHighlight] = useState(0);
+  const [busy, setBusy] = useState(false);
+
+  const matches = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    const pool = q
+      ? available.filter(
+          (s) =>
+            s.name.toLowerCase().includes(q) ||
+            s.symbol.toLowerCase().includes(q) ||
+            s.sector.toLowerCase().includes(q)
+        )
+      : available;
+    return pool.slice(0, 8);
+  }, [query, available]);
+
+  const add = async (symbol: string) => {
+    setBusy(true);
+    await onAdd(symbol);
+    setBusy(false);
+    setQuery("");
+    setOpen(false);
+  };
+
+  const showList = open && matches.length > 0;
+
+  return (
+    <div className="relative mt-4">
+      <label htmlFor="stock-search" className="sr-only">
+        Search stocks to add to your watchlist
+      </label>
+      <input
+        id="stock-search"
+        type="text"
+        role="combobox"
+        aria-expanded={showList}
+        aria-controls="stock-search-results"
+        aria-autocomplete="list"
+        autoComplete="off"
+        disabled={busy}
+        className="w-full rounded border border-line-strong bg-surface px-3 py-2 text-sm text-fg outline-none focus:border-fg-muted disabled:opacity-50"
+        placeholder={
+          available.length === 0
+            ? "You're watching every stock in the universe"
+            : "Search stocks by name, symbol or sector…"
+        }
+        value={query}
+        onFocus={() => setOpen(true)}
+        // Blur fires before click, so a plain onClick on a result would never
+        // run. Delay just past the click, and let onMouseDown handle the pick.
+        onBlur={() => setTimeout(() => setOpen(false), 120)}
+        onChange={(e) => {
+          setQuery(e.target.value);
+          // Reset the highlighted row here rather than in an effect keyed on
+          // `query` — same result, one render instead of two.
+          setHighlight(0);
+          setOpen(true);
+        }}
+        onKeyDown={(e) => {
+          if (!showList) return;
+          if (e.key === "ArrowDown") {
+            e.preventDefault();
+            setHighlight((h) => (h + 1) % matches.length);
+          } else if (e.key === "ArrowUp") {
+            e.preventDefault();
+            setHighlight((h) => (h - 1 + matches.length) % matches.length);
+          } else if (e.key === "Enter") {
+            e.preventDefault();
+            void add(matches[highlight].symbol);
+          } else if (e.key === "Escape") {
+            setOpen(false);
+          }
+        }}
+      />
+
+      {showList && (
+        <ul
+          id="stock-search-results"
+          role="listbox"
+          className="absolute z-10 mt-1 max-h-72 w-full overflow-y-auto rounded border border-line-strong bg-surface shadow-lg"
+        >
+          {matches.map((s, i) => (
+            <li key={s.symbol} role="option" aria-selected={i === highlight}>
+              <button
+                type="button"
+                onMouseEnter={() => setHighlight(i)}
+                onMouseDown={(e) => {
+                  e.preventDefault();
+                  void add(s.symbol);
+                }}
+                className={`flex w-full items-baseline justify-between px-3 py-2 text-left text-sm ${
+                  i === highlight ? "bg-surface-muted" : ""
+                }`}
+              >
+                <span>{s.name}</span>
+                <span className="ml-3 shrink-0 text-xs text-fg-faint">{s.symbol}</span>
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
+
+      {open && query.trim() !== "" && matches.length === 0 && (
+        <p className="absolute z-10 mt-1 w-full rounded border border-line bg-surface px-3 py-2 text-sm text-fg-muted">
+          No stocks match &ldquo;{query.trim()}&rdquo;.
+        </p>
       )}
     </div>
   );
 }
 
 export default function Home() {
-  const { handle, identify } = useIdentity();
+  const { handle, identify, signOut } = useIdentity();
   const [data, setData] = useState<WatchlistResponse | null>(null);
-  const [addSymbol, setAddSymbol] = useState("");
-  const [stockSearch, setStockSearch] = useState("");
+  const [notice, setNotice] = useState<string | null>(null);
+  // Re-rendered relative timestamps ("2 days ago") need a clock that ticks,
+  // and taking it from state keeps server and first client render identical.
+  const [now, setNow] = useState(() => Date.now());
+  // View filter only — these are the three groups the scoring already
+  // produces, not user-managed lists. No schema, no server state: switching
+  // tabs re-filters data the page already has.
+  const [tab, setTab] = useState<TabId>("ALL");
+  // Monotonic request id: two in-flight refreshes can resolve out of order,
+  // and an older response overwriting a newer one is the same class of bug
+  // the server-side monotonicity guard fixes for quotes.
+  const requestSeq = useRef(0);
 
   const refresh = useCallback(() => {
-    fetch("/api/watchlist")
+    const seq = ++requestSeq.current;
+    return fetch("/api/watchlist")
       .then((r) => (r.ok ? r.json() : null))
-      .then((d) => d && setData(d));
+      .then((json) => {
+        // Drop a response that a newer request has already overtaken.
+        if (json && seq === requestSeq.current) {
+          setData(json);
+          setNow(Date.now());
+        }
+      })
+      .catch(() => {
+        // A dropped refresh is not worth surfacing — the next tick retries
+        // and the feed-health banner already reports a genuinely broken feed.
+      });
   }, []);
 
   useEffect(() => {
@@ -276,114 +592,145 @@ export default function Home() {
     // (it 401s and gets silently swallowed) but wrong: this guard means
     // "we have a real handle," and "loading" isn't one.
     if (handle && handle !== "loading") {
-      refresh();
-      const id = setInterval(refresh, 15_000);
+      void refresh();
+      const id = setInterval(() => void refresh(), 15_000);
       return () => clearInterval(id);
     }
   }, [handle, refresh]);
 
-  if (handle === "loading") return null;
-  if (!handle) return <IdentityGate onIdentify={identify} />;
+  // Clear a transient notice after a few seconds so it doesn't linger.
+  useEffect(() => {
+    if (!notice) return;
+    const id = setTimeout(() => setNotice(null), 4000);
+    return () => clearTimeout(id);
+  }, [notice]);
 
-  const watchedSymbols = new Set(data?.items.map((i) => i.symbol));
-  const available = NSE_40_UNIVERSE.filter((s) => !watchedSymbols.has(s.symbol));
-  const query = stockSearch.trim().toLowerCase();
-  const filteredAvailable = query
-    ? available.filter((s) => s.name.toLowerCase().includes(query) || s.symbol.toLowerCase().includes(query))
-    : available;
+  const watchedSymbols = useMemo(() => new Set(data?.items.map((i) => i.symbol)), [data]);
+  const available = useMemo(
+    () => NSE_40_UNIVERSE.filter((s) => !watchedSymbols.has(s.symbol)),
+    [watchedSymbols]
+  );
 
   // "Don't make me scan everything" — sort by what deserves attention first,
   // and separate the unchanged so it can be visually demoted, not just
   // rendered in whatever order items happen to be in.
-  const sorted = [...(data?.items ?? [])].sort((a, b) => {
-    const rankDiff = TIER_CONFIG[b.card?.tier ?? "QUIET"].rank - TIER_CONFIG[a.card?.tier ?? "QUIET"].rank;
-    if (rankDiff !== 0) return rankDiff;
-    return Math.abs(b.card?.zScore ?? 0) - Math.abs(a.card?.zScore ?? 0);
-  });
+  const sorted = useMemo(
+    () =>
+      [...(data?.items ?? [])].sort((a, b) => {
+        const rankDiff = TIER_CONFIG[b.card?.tier ?? "QUIET"].rank - TIER_CONFIG[a.card?.tier ?? "QUIET"].rank;
+        if (rankDiff !== 0) return rankDiff;
+        return Math.abs(b.card?.zScore ?? 0) - Math.abs(a.card?.zScore ?? 0);
+      }),
+    [data]
+  );
+
+  if (handle === "loading") return null;
+  if (!handle) return <IdentityGate onIdentify={identify} />;
+
   const needsAttention = sorted.filter((i) => i.card && i.card.tier !== "QUIET" && i.card.tier !== "NEW");
   const newItems = sorted.filter((i) => i.card?.tier === "NEW");
   const unchanged = sorted.filter((i) => !i.card || i.card.tier === "QUIET");
+  const counts: Record<TabId, number> = {
+    ALL: sorted.length,
+    ATTENTION: needsAttention.length,
+    NEW: newItems.length,
+    QUIET: unchanged.length,
+  };
+
+  const addStock = async (symbol: string) => {
+    const res = await fetch("/api/watchlist", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ symbol }),
+    });
+    if (!res.ok) setNotice("Couldn't add that stock — try again.");
+    await refresh();
+  };
 
   const removeSymbol = async (symbol: string) => {
     await fetch(`/api/watchlist?symbol=${encodeURIComponent(symbol)}`, { method: "DELETE" });
-    refresh();
+    await refresh();
+  };
+
+  const markSeen = async (symbol?: string) => {
+    const res = await fetch("/api/watchlist/mark-seen", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(symbol ? { symbol } : {}),
+    });
+    // Tell the user what actually happened. Clicking this before the feed has
+    // warmed up used to mark nothing, show no error, and silently leave the
+    // baseline unset.
+    if (res.ok) {
+      const d = await res.json();
+      if (d.updated === 0) setNotice("Nothing marked yet — still waiting for the first live quote.");
+      else if (d.skipped > 0) setNotice(`Baseline set for ${d.updated}; ${d.skipped} had no quote yet.`);
+      else setNotice(`Baseline set for ${d.updated} ${d.updated === 1 ? "stock" : "stocks"}.`);
+    } else {
+      setNotice("Couldn't set the baseline — try again.");
+    }
+    await refresh();
   };
 
   const simulateEvent = async (symbol: string) => {
     const preset = SHOCK_PRESETS[Math.floor(Math.random() * SHOCK_PRESETS.length)];
-    await fetch("/api/dev/shock", {
+    const res = await fetch("/api/dev/shock", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ symbol, ...preset }),
     });
-    refresh();
+    if (!res.ok) setNotice("Simulated events are disabled on this deployment.");
+    await refresh();
   };
 
   const clearSimulation = async (symbol: string) => {
     await fetch(`/api/dev/shock?symbol=${encodeURIComponent(symbol)}`, { method: "DELETE" });
-    refresh();
+    await refresh();
+  };
+
+  const cardProps = {
+    now,
+    onRemove: removeSymbol,
+    onMarkSeen: (s: string) => void markSeen(s),
+    onSimulate: simulateEvent,
+    onClearSimulation: clearSimulation,
   };
 
   return (
     <main className="mx-auto max-w-2xl px-4 py-8">
       <div className="mb-6 flex items-center justify-between">
-        <h1 className="text-xl font-semibold">Since You Last Checked</h1>
-        <span className="text-sm text-neutral-500">{handle}</span>
+        <div>
+          <h1 className="text-xl font-semibold">Since You Last Checked</h1>
+          <p className="text-xs text-fg-faint">
+            A smart NSE watchlist that surfaces what actually changed while you were away.
+          </p>
+        </div>
+        <div className="flex items-center gap-3 text-sm">
+          <span className="text-fg-muted">{handle}</span>
+          <button
+            onClick={() => {
+              // Clear the locally-rendered watchlist too, so the next person
+              // to type a name never sees a flash of someone else's list.
+              setData(null);
+              void signOut();
+            }}
+            className="text-fg-faint underline underline-offset-2 hover:text-fg"
+          >
+            switch
+          </button>
+        </div>
       </div>
 
-      {data && <MarketStatusBanner status={data.marketStatus} lastPollAt={data.lastPollAt} />}
+      {data && (
+        <MarketStatusBanner status={data.marketStatus} lastPollAt={data.lastPollAt} feedHealth={data.feedHealth} />
+      )}
 
-      <input
-        type="text"
-        className="mt-4 w-full rounded border border-neutral-700 bg-neutral-900 px-3 py-2 text-sm outline-none focus:border-neutral-400"
-        placeholder="Search stocks by name or symbol…"
-        value={stockSearch}
-        onChange={(e) => {
-          setStockSearch(e.target.value);
-          // Reset the selection when the search narrows the option list, so
-          // "Add" never stays enabled for a symbol that's no longer visible.
-          setAddSymbol("");
-        }}
-      />
-
-      <div className="mt-2 flex gap-2">
-        <select
-          className="flex-1 rounded border border-neutral-700 bg-neutral-900 px-3 py-2 text-sm"
-          value={addSymbol}
-          onChange={(e) => setAddSymbol(e.target.value)}
-        >
-          <option value="">{filteredAvailable.length > 0 ? "Add a stock…" : "No matches"}</option>
-          {filteredAvailable.map((s) => (
-            <option key={s.symbol} value={s.symbol}>
-              {s.name} ({s.symbol})
-            </option>
-          ))}
-        </select>
-        <button
-          disabled={!addSymbol}
-          onClick={async () => {
-            await fetch("/api/watchlist", {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ symbol: addSymbol }),
-            });
-            setAddSymbol("");
-            setStockSearch("");
-            refresh();
-          }}
-          className="rounded bg-neutral-100 px-4 py-2 text-sm font-medium text-black disabled:opacity-50"
-        >
-          Add
-        </button>
-      </div>
+      <AddStock available={available} onAdd={addStock} />
 
       {data && data.items.length > 0 && (
         <button
-          onClick={async () => {
-            await fetch("/api/watchlist/mark-seen", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
-            refresh();
-          }}
-          className="mt-4 w-full rounded border border-neutral-700 py-2 text-sm text-neutral-300 hover:bg-neutral-900"
+          onClick={() => void markSeen()}
+          className="mt-3 w-full rounded border border-line-strong py-2 text-sm text-fg-muted hover:bg-surface-muted hover:text-fg"
         >
           Mark all as seen
         </button>
@@ -393,58 +740,102 @@ export default function Home() {
         <button
           onClick={async () => {
             await fetch("/api/dev/shock", { method: "DELETE" });
-            refresh();
+            await refresh();
           }}
-          className="mt-2 w-full rounded border border-violet-800 py-1.5 text-xs text-violet-300 hover:bg-violet-950/40"
+          className="mt-2 w-full rounded border border-accent/50 py-1.5 text-xs text-accent hover:bg-accent/10"
         >
           Clear all simulated events
         </button>
       )}
 
+      {/* Both the attention summary and transient notices are announced —
+          content changes every 15s with no other cue for a screen reader. */}
+      <div aria-live="polite" className="min-h-[1.5rem]">
+        {notice && <p className="mt-4 text-sm text-accent">{notice}</p>}
+        {!notice && data && data.items.length > 0 && (
+          <p className="mt-4 text-sm text-fg-muted">
+            {needsAttention.length === 0
+              ? unchanged.length > 0
+                ? `Nothing needs your attention — ${unchanged.length} quiet.`
+                : "New stocks below — check back later to see what changes."
+              : `${needsAttention.length} of ${data.items.length} need your attention.`}
+          </p>
+        )}
+      </div>
+
       {data && data.items.length > 0 && (
-        <p className="mt-4 text-sm text-neutral-400">
-          {needsAttention.length === 0
-            ? unchanged.length > 0
-              ? `Nothing needs your attention — ${unchanged.length} quiet.`
-              : "New stocks below — check back later to see what changes."
-            : `${needsAttention.length} of ${data.items.length} need your attention.`}
-        </p>
+        <div role="tablist" aria-label="Filter watchlist" className="mt-4 flex flex-wrap gap-1 border-b border-line">
+          {TABS.map((t) => {
+            const count = counts[t.id];
+            const active = tab === t.id;
+            return (
+              <button
+                key={t.id}
+                role="tab"
+                aria-selected={active}
+                onClick={() => setTab(t.id)}
+                className={`-mb-px rounded-t border-b-2 px-3 py-1.5 text-sm ${
+                  active
+                    ? "border-fg font-medium text-fg"
+                    : "border-transparent text-fg-muted hover:text-fg"
+                }`}
+              >
+                {t.label}
+                <span className="ml-1.5 text-xs text-fg-faint">{count}</span>
+              </button>
+            );
+          })}
+        </div>
       )}
 
-      {needsAttention.length > 0 && (
-        <div className="mt-3 space-y-3">
+      {(tab === "ALL" || tab === "ATTENTION") && needsAttention.length > 0 && (
+        <div className="mt-4 space-y-3">
           {needsAttention.map((item) => (
-            <Card key={item.symbol} item={item} onRemove={removeSymbol} onSimulate={simulateEvent} onClearSimulation={clearSimulation} />
+            <Card key={item.symbol} item={item} {...cardProps} />
           ))}
         </div>
       )}
 
-      {newItems.length > 0 && (
+      {(tab === "ALL" || tab === "NEW") && newItems.length > 0 && (
         <div className="mt-6">
-          <p className="mb-2 text-xs uppercase tracking-wide text-neutral-600">New</p>
+          {/* The heading is redundant once a tab already names the group. */}
+          {tab === "ALL" && <p className="mb-2 text-xs uppercase tracking-wide text-fg-faint">New</p>}
           <div className="space-y-2">
             {newItems.map((item) => (
-              <Card key={item.symbol} item={item} onRemove={removeSymbol} onSimulate={simulateEvent} onClearSimulation={clearSimulation} />
+              <Card key={item.symbol} item={item} {...cardProps} />
             ))}
           </div>
         </div>
       )}
 
-      {unchanged.length > 0 && (
+      {(tab === "ALL" || tab === "QUIET") && unchanged.length > 0 && (
         <div className="mt-6">
-          <p className="mb-2 text-xs uppercase tracking-wide text-neutral-600">
-            {needsAttention.length > 0 || newItems.length > 0 ? "Unchanged" : "Your watchlist"}
-          </p>
+          {tab === "ALL" && (
+            <p className="mb-2 text-xs uppercase tracking-wide text-fg-faint">
+              {needsAttention.length > 0 || newItems.length > 0 ? "Unchanged" : "Your watchlist"}
+            </p>
+          )}
           <div className="space-y-2">
             {unchanged.map((item) => (
-              <Card key={item.symbol} item={item} onRemove={removeSymbol} onSimulate={simulateEvent} onClearSimulation={clearSimulation} />
+              <Card key={item.symbol} item={item} {...cardProps} />
             ))}
           </div>
         </div>
+      )}
+
+      {/* An empty tab needs to say so, or it reads as a broken page. */}
+      {data && data.items.length > 0 && counts[tab] === 0 && (
+        <p className="mt-6 text-center text-sm text-fg-muted">
+          {tab === "ATTENTION"
+            ? "Nothing needs your attention right now."
+            : tab === "NEW"
+              ? "No newly added stocks — everything here has a baseline."
+              : "Nothing quiet — everything is flagged."}
+        </p>
       )}
 
       {data && data.items.length === 0 && (
-        <p className="mt-6 text-center text-sm text-neutral-500">Your watchlist is empty — add a stock above.</p>
+        <p className="mt-6 text-center text-sm text-fg-muted">Your watchlist is empty — add a stock above.</p>
       )}
     </main>
   );
