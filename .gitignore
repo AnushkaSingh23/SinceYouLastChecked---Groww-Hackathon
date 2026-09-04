@@ -54,3 +54,4 @@ next-env.d.ts
 # local tooling + build artifacts (the zip contains a copy of this repo)
 .claude/
 /groww_hack.zip
+"skills-lock.json"  
