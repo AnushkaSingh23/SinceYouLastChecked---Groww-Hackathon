@@ -1,7 +1,6 @@
 import { NextResponse } from "next/server";
 import { getCurrentUserId } from "@/lib/auth";
 import { marketFeedStore } from "@/lib/marketFeedStore";
-import { NSE_40_UNIVERSE } from "@/lib/nseUniverse";
 
 // Dev/demo-only: inject or clear a simulated market event on a symbol.
 // Not user-scoped — this overlays the shared live feed everyone sees, which
@@ -37,8 +36,18 @@ export async function POST(request: Request) {
   const body = await request.json().catch(() => null);
   const symbol = typeof body?.symbol === "string" ? body.symbol : "";
 
-  if (!NSE_40_UNIVERSE.some((s) => s.symbol === symbol)) {
-    return NextResponse.json({ error: "Unknown symbol" }, { status: 400 });
+  // Any NSE ticker, not just the curated set — the watchlist is no longer
+  // capped at 40 symbols, so the demo control must not be either. A shock only
+  // means anything for a symbol the feed is already tracking, which is exactly
+  // the set that has a quote cached.
+  if (!/^[A-Z0-9&._-]{1,20}\.NS$/.test(symbol)) {
+    return NextResponse.json({ error: "Not a valid NSE symbol" }, { status: 400 });
+  }
+  if (!marketFeedStore.getQuote(symbol)) {
+    return NextResponse.json(
+      { error: "No live quote for that symbol yet — add it to a watchlist first." },
+      { status: 400 }
+    );
   }
 
   const priceOverridePct = typeof body?.priceOverridePct === "number" ? body.priceOverridePct : undefined;

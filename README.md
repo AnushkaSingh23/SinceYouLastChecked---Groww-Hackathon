@@ -42,10 +42,11 @@ real answer. There is no black-box score.
 z = |% move since you last checked| / (σ × √(elapsed trading time))
 ```
 
-- **σ** is the stock's daily-equivalent volatility. It starts from a
-  hand-checked seed per ticker and switches to **live-observed** volatility once
-  enough real ticks arrive this session. The card tells you which is in use
-  (`live volatility` vs `seed volatility (warming up)`) rather than hiding it.
+- **σ** is the stock's daily-equivalent volatility. It starts from a seed
+  **derived from that symbol's own 3-month price history**, then switches to
+  **live-observed** volatility once enough real ticks arrive this session. The
+  card tells you which is in use (`live volatility` vs `seed volatility
+  (warming up)`) rather than hiding it.
 - **√(elapsed time)** is standard square-root-of-time scaling — the same maths
   behind annualising a daily volatility. A move is more surprising the less time
   it had to happen in.
@@ -190,7 +191,7 @@ Open <http://localhost:3000>.
 ### Using it
 
 1. Enter any name — no password. The name *is* the account.
-2. Search stocks by name, symbol or sector; click a result to add it.
+2. Search **any NSE stock** by name or symbol; click a result to add it.
 3. Click **Mark all as seen** to set your baseline.
 4. Click **⚡ simulate event** on any card. NSE is open six hours a day, so
    outside those hours there is genuinely nothing to see — this injects a
@@ -256,8 +257,29 @@ returns under zeros, understates σ, and makes ordinary moves read as CRITICAL.
 **Data source:** Yahoo Finance's public v8 chart endpoint. The commonly
 recommended v7 batch endpoint now returns 401 without a session cookie and crumb
 token, so this uses v8 with a small concurrency cap instead of one batched call.
-The 40-ticker list is current — it corrects two tickers that changed through
-real corporate actions (`ZOMATO` → `ETERNAL`, `TATAMOTORS` → `TMPV`).
+
+**Any NSE stock can be watched**, not a fixed list. Symbol search hits the
+exchange live, a new symbol is validated by whether it returns a real quote, and
+the poller tracks the union of everything anyone actually watches (bounded at
+250 symbols per process) rather than a hardcoded universe.
+
+That was only possible after removing the reason the list was hardcoded: every
+ticker needed a `baseSigma` volatility seed typed in by hand. `seedVolatility.ts`
+now derives it from the symbol's own 3-month history. Checked against the
+hand-written table, the derived value matched closely for HDFCBANK (0.0134 vs
+0.013) and was materially better for volatile names, where the hardcoded figures
+had drifted to roughly double the realised value (ADANIENT 0.0196 vs 0.038).
+
+A curated 40-name set survives for two jobs: suggestions in an empty search box,
+and an offline fallback seed. It is worth keeping for a third reason — every
+ticker in it was verified against the live feed, which caught two that had
+changed through real corporate actions (`ZOMATO` → `ETERNAL`,
+`TATAMOTORS` → `TMPV`). Both now fail to resolve entirely; a naive list would be
+silently broken.
+
+Upstream search alone is not reliable on the names people actually type —
+"infosys" returns HCL Infosystems but not INFY — so curated names are matched
+locally and listed first, with live results appended.
 
 **Stack:** Next.js 16 (App Router) · React 19 · TypeScript · Tailwind v4 ·
 Prisma 7 + SQLite via the `better-sqlite3` driver adapter.
@@ -313,11 +335,13 @@ Stated plainly, because knowing where a system is weak is part of building it.
 - **Volume is not time-of-day normalised.** NSE volume is U-shaped; 2.5× is
   unremarkable at 9:20 and significant at 12:30. The two-poll confirmation is a
   mitigation, not the real fix.
+- **Volatility seeds come from 3 months of daily bars.** A shorter window
+  reacts faster but is noisier; a stock with a corporate action inside the
+  window can produce a distorted seed, so the value is clamped to a plausible
+  range. The live-observed estimate takes over after ~10 ticks regardless.
 - **Only verified NSE holidays are in the calendar.** A wrong holiday is worse
   than a missing one — it would make the app claim "closed" on a real trading
   day.
-- **σ seeds are hand-written** and will drift. Deriving them from real historical
-  bars at startup would remove the hardcoded table.
 - **No sector- or index-relative context.** *"ITC is down 3.1% while FMCG is
   flat"* and *"ITC is down 3.1% and FMCG is down 2.9%"* are completely different
   news; the app currently says the same thing for both.

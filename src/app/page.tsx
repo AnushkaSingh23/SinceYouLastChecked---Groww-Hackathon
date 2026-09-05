@@ -1,7 +1,6 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { NSE_40_UNIVERSE } from "@/lib/nseUniverse";
 // Import the card shape from where it's actually defined instead of
 // hand-duplicating it here — a hand-copied interface already drifted once
 // (this file was missing `zScoreClamped` until it was added by hand at the
@@ -431,45 +430,86 @@ function Card({
  * separate <select> — two controls, two steps, and an "Add" button that
  * could stay enabled for a symbol the filter had just hidden.
  */
+interface SymbolHit {
+  symbol: string;
+  name: string;
+  sector: string | null;
+}
+
+/**
+ * Live NSE symbol search.
+ *
+ * This used to filter a hardcoded 40-ticker array bundled into the browser,
+ * which meant a real stock the user actually held — Tata Power, say — simply
+ * could not be added, and shipped the whole table (sectors, volatility seeds)
+ * into the client for a list the UI barely used. It now queries the exchange,
+ * so anything tradeable on the NSE can be watched.
+ */
 function AddStock({
-  available,
+  watched,
   onAdd,
 }: {
-  available: { symbol: string; name: string; sector: string }[];
-  onAdd: (symbol: string) => Promise<void>;
+  watched: Set<string>;
+  onAdd: (symbol: string, name: string) => Promise<boolean>;
 }) {
   const [query, setQuery] = useState("");
+  const [results, setResults] = useState<SymbolHit[]>([]);
   const [open, setOpen] = useState(false);
   const [highlight, setHighlight] = useState(0);
   const [busy, setBusy] = useState(false);
+  const [searching, setSearching] = useState(false);
+  // Monotonic id so a slow response for an earlier query can't overwrite the
+  // results of a later one — the user types faster than the network replies.
+  const seq = useRef(0);
 
-  const matches = useMemo(() => {
-    const q = query.trim().toLowerCase();
-    const pool = q
-      ? available.filter(
-          (s) =>
-            s.name.toLowerCase().includes(q) ||
-            s.symbol.toLowerCase().includes(q) ||
-            s.sector.toLowerCase().includes(q)
-        )
-      : available;
-    return pool.slice(0, 8);
-  }, [query, available]);
+  useEffect(() => {
+    const mine = ++seq.current;
+    const q = query.trim();
 
-  const add = async (symbol: string) => {
+    // Debounced: one request per pause in typing, not one per keystroke.
+    // `searching` is set in the change handler rather than here, so this
+    // effect only ever updates state from the fetch callback.
+    const id = setTimeout(() => {
+      fetch(`/api/symbols/search?q=${encodeURIComponent(q)}`)
+        .then((r) => (r.ok ? r.json() : null))
+        .then((d) => {
+          if (mine !== seq.current) return;
+          setResults(Array.isArray(d?.results) ? d.results : []);
+          setSearching(false);
+          setHighlight(0);
+        })
+        .catch(() => {
+          if (mine === seq.current) setSearching(false);
+        });
+    }, q.length >= 2 ? 250 : 0);
+
+    return () => clearTimeout(id);
+  }, [query]);
+
+  // Hide anything already on the watchlist — adding it again is a no-op.
+  const matches = useMemo(
+    () => results.filter((r) => !watched.has(r.symbol)).slice(0, 8),
+    [results, watched]
+  );
+
+  const add = async (hit: SymbolHit) => {
     setBusy(true);
-    await onAdd(symbol);
+    const ok = await onAdd(hit.symbol, hit.name);
     setBusy(false);
-    setQuery("");
-    setOpen(false);
+    if (ok) {
+      setQuery("");
+      setResults([]);
+      setOpen(false);
+    }
   };
 
   const showList = open && matches.length > 0;
+  const noMatches = open && !searching && query.trim().length >= 2 && matches.length === 0;
 
   return (
     <div className="relative mt-4">
       <label htmlFor="stock-search" className="sr-only">
-        Search stocks to add to your watchlist
+        Search any NSE stock to add to your watchlist
       </label>
       <input
         id="stock-search"
@@ -481,21 +521,16 @@ function AddStock({
         autoComplete="off"
         disabled={busy}
         className="w-full rounded border border-line-strong bg-surface px-3 py-2 text-sm text-fg outline-none focus:border-fg-muted disabled:opacity-50"
-        placeholder={
-          available.length === 0
-            ? "You're watching every stock in the universe"
-            : "Search stocks by name, symbol or sector…"
-        }
+        placeholder="Search any NSE stock by name or symbol…"
         value={query}
         onFocus={() => setOpen(true)}
         // Blur fires before click, so a plain onClick on a result would never
         // run. Delay just past the click, and let onMouseDown handle the pick.
         onBlur={() => setTimeout(() => setOpen(false), 120)}
         onChange={(e) => {
-          setQuery(e.target.value);
-          // Reset the highlighted row here rather than in an effect keyed on
-          // `query` — same result, one render instead of two.
-          setHighlight(0);
+          const next = e.target.value;
+          setQuery(next);
+          setSearching(next.trim().length >= 2);
           setOpen(true);
         }}
         onKeyDown={(e) => {
@@ -508,7 +543,7 @@ function AddStock({
             setHighlight((h) => (h - 1 + matches.length) % matches.length);
           } else if (e.key === "Enter") {
             e.preventDefault();
-            void add(matches[highlight].symbol);
+            void add(matches[highlight]);
           } else if (e.key === "Escape") {
             setOpen(false);
           }
@@ -528,23 +563,29 @@ function AddStock({
                 onMouseEnter={() => setHighlight(i)}
                 onMouseDown={(e) => {
                   e.preventDefault();
-                  void add(s.symbol);
+                  void add(s);
                 }}
-                className={`flex w-full items-baseline justify-between px-3 py-2 text-left text-sm ${
+                className={`flex w-full items-baseline justify-between gap-3 px-3 py-2 text-left text-sm ${
                   i === highlight ? "bg-surface-muted" : ""
                 }`}
               >
-                <span>{s.name}</span>
-                <span className="ml-3 shrink-0 text-xs text-fg-faint">{s.symbol}</span>
+                <span className="truncate">{s.name}</span>
+                <span className="shrink-0 text-xs text-fg-faint">{s.symbol.replace(/\.NS$/, "")}</span>
               </button>
             </li>
           ))}
         </ul>
       )}
 
-      {open && query.trim() !== "" && matches.length === 0 && (
+      {searching && !showList && (
+        <p className="absolute z-10 mt-1 w-full rounded border border-line bg-surface px-3 py-2 text-sm text-fg-faint">
+          Searching the NSE…
+        </p>
+      )}
+
+      {noMatches && (
         <p className="absolute z-10 mt-1 w-full rounded border border-line bg-surface px-3 py-2 text-sm text-fg-muted">
-          No stocks match &ldquo;{query.trim()}&rdquo;.
+          No NSE stocks match &ldquo;{query.trim()}&rdquo;.
         </p>
       )}
     </div>
@@ -606,11 +647,6 @@ export default function Home() {
   }, [notice]);
 
   const watchedSymbols = useMemo(() => new Set(data?.items.map((i) => i.symbol)), [data]);
-  const available = useMemo(
-    () => NSE_40_UNIVERSE.filter((s) => !watchedSymbols.has(s.symbol)),
-    [watchedSymbols]
-  );
-
   // "Don't make me scan everything" — sort by what deserves attention first,
   // and separate the unchanged so it can be visually demoted, not just
   // rendered in whatever order items happen to be in.
@@ -637,14 +673,21 @@ export default function Home() {
     QUIET: unchanged.length,
   };
 
-  const addStock = async (symbol: string) => {
+  const addStock = async (symbol: string, name: string) => {
     const res = await fetch("/api/watchlist", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ symbol }),
+      // Pass the name through from the search result so the card is labelled
+      // correctly without a second lookup.
+      body: JSON.stringify({ symbol, name }),
     });
-    if (!res.ok) setNotice("Couldn't add that stock — try again.");
+    if (!res.ok) {
+      const d = await res.json().catch(() => null);
+      setNotice(d?.error ?? "Couldn't add that stock — try again.");
+      return false;
+    }
     await refresh();
+    return true;
   };
 
   const removeSymbol = async (symbol: string) => {
@@ -725,7 +768,7 @@ export default function Home() {
         <MarketStatusBanner status={data.marketStatus} lastPollAt={data.lastPollAt} feedHealth={data.feedHealth} />
       )}
 
-      <AddStock available={available} onAdd={addStock} />
+      <AddStock watched={watchedSymbols} onAdd={addStock} />
 
       {data && data.items.length > 0 && (
         <button

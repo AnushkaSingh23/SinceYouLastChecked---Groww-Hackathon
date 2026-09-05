@@ -14,6 +14,7 @@ import { VolumeAnomalyTracker, classifyVolumeRatio } from "./volumeAnomaly";
 import { scoreSymbol, type AttentionCard, type LastSeen } from "./scoring";
 import { ShockInjector, type ShockOverride } from "./shockInjector";
 import { getNSEMarketStatus } from "./marketHours";
+import { warmSeedVolatility } from "./seedVolatility";
 
 // While the market is open, quotes move and 20s is a sensible cadence.
 // While it's closed they cannot move, so polling at the same rate is
@@ -28,6 +29,13 @@ const POLL_INTERVAL_CLOSED_MS = 5 * 60_000;
 // down feed isn't hammered at full rate (which is what keeps it rate-limited).
 const BACKOFF_BASE_MS = 30_000;
 const BACKOFF_MAX_MS = 5 * 60_000;
+
+// Hard ceiling on how many symbols one process will poll. Symbols are now
+// added on demand (anyone can watch any NSE stock), so without a bound a
+// handful of users with large watchlists could push a single cycle past its
+// own interval. Well above any realistic demo, and the cap is reported through
+// feed health rather than silently dropping symbols.
+const MAX_TRACKED_SYMBOLS = 250;
 
 type Listener = (quotes: NSEQuote[]) => void;
 
@@ -60,11 +68,37 @@ class MarketFeedStore {
   private symbolsAttempted = 0;
   private shocks = new ShockInjector();
 
+  /** Symbols this process polls. Grows as users add stocks; see ensureTracked. */
+  private tracked = new Set<string>();
+
   constructor() {
-    for (const s of NSE_40_UNIVERSE) {
-      this.trackers.set(s.symbol, new SymbolVolatilityTracker(s.symbol));
-      this.volumeTrackers.set(s.symbol, new VolumeAnomalyTracker(s.symbol));
+    // The curated universe is only a warm starting set now, not the ceiling —
+    // any NSE symbol can be added at runtime through ensureTracked().
+    this.ensureTracked(NSE_40_UNIVERSE.map((s) => s.symbol));
+  }
+
+  /**
+   * Registers symbols for polling, creating their trackers on first sight.
+   * Called by the watchlist route on every read, so a symbol someone added on
+   * another device (or before this process started) starts being polled as
+   * soon as anyone looks at it.
+   */
+  ensureTracked(symbols: string[]): void {
+    for (const symbol of symbols) {
+      if (this.tracked.has(symbol)) continue;
+      if (this.tracked.size >= MAX_TRACKED_SYMBOLS) break;
+
+      this.tracked.add(symbol);
+      this.trackers.set(symbol, new SymbolVolatilityTracker(symbol));
+      this.volumeTrackers.set(symbol, new VolumeAnomalyTracker(symbol));
+      // Derive this symbol's real starting volatility in the background. Until
+      // it lands, scoring falls back to the curated table or a flat default.
+      warmSeedVolatility(symbol);
     }
+  }
+
+  getTrackedSymbols(): string[] {
+    return Array.from(this.tracked);
   }
 
   getTracker(symbol: string): SymbolVolatilityTracker | undefined {
@@ -103,6 +137,10 @@ class MarketFeedStore {
 
   /** Scores one symbol against an optional last-seen snapshot. Returns null if we have no quote for it yet. */
   getAttentionCard(symbol: string, lastSeen: LastSeen | null): AttentionCard | null {
+    // Register on demand: a symbol can be watched before this process has ever
+    // seen it (added on another device, or added before a restart).
+    this.ensureTracked([symbol]);
+
     const quote = this.quotes.get(symbol);
     const tracker = this.trackers.get(symbol);
     const volumeTracker = this.volumeTrackers.get(symbol);
@@ -175,7 +213,7 @@ class MarketFeedStore {
     // and on modern Node an unhandled rejection terminates the process. A
     // transient fetch failure must not be able to take the server down.
     try {
-      const symbols = NSE_40_UNIVERSE.map((s) => s.symbol);
+      const symbols = Array.from(this.tracked);
       this.symbolsAttempted = symbols.length;
 
       const fresh = await fetchNSEUniverseQuotes(symbols);

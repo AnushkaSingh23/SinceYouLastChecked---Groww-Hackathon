@@ -17,6 +17,7 @@
 
 import { NSE_40_UNIVERSE } from "./nseUniverse";
 import { TRADING_DAY_MS } from "./marketHours";
+import { getCachedSeedVolatility } from "./seedVolatility";
 
 // One canonical definition of a session's length, owned by marketHours.ts
 // (which also knows *which* wall-clock spans count as trading time).
@@ -63,8 +64,18 @@ export class SymbolVolatilityTracker {
     return this.tickBuffer[this.tickBuffer.length - 1];
   }
 
+  /**
+   * Starting volatility, best source first:
+   *   1. sigma derived from this symbol's own 3-month history (seedVolatility.ts)
+   *   2. the hand-written table for the curated universe, as an offline fallback
+   *   3. a flat default
+   *
+   * (1) is what allows any NSE symbol to be watched rather than only the 40
+   * that had a constant typed in by hand. It's populated asynchronously when a
+   * symbol is first watched, so (2)/(3) cover the brief window before it lands.
+   */
   private seedSigma(): number {
-    return SEED_SIGMA_BY_SYMBOL[this.symbol] ?? DEFAULT_SEED_SIGMA;
+    return getCachedSeedVolatility(this.symbol) ?? SEED_SIGMA_BY_SYMBOL[this.symbol] ?? DEFAULT_SEED_SIGMA;
   }
 
   /**

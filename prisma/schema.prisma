@@ -26,6 +26,11 @@ model WatchlistItem {
   user    User   @relation(fields: [userId], references: [id], onDelete: Cascade)
   symbol  String
 
+  // Company name captured when the stock was added. Any NSE symbol can now be
+  // watched, not just a curated 40, so there is no local table to look a name
+  // up in — storing it here avoids a network round trip per item on render.
+  name    String?
+
   addedAt DateTime @default(now())
 
   lastSeen LastSeenSnapshot?
