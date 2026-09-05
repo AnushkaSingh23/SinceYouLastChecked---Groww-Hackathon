@@ -9,6 +9,7 @@ import { TRADING_DAY_MS, tradingElapsedBetween } from "./marketHours";
 import {
   classifyVolumeRatio,
   VOLUME_ELEVATED_RATIO,
+  VOLUME_SURGE_RATIO,
   type VolumeAnomalyResult,
   type VolumeLevel,
 } from "./volumeAnomaly";
@@ -31,6 +32,17 @@ const escalate = (t: Tier): Tier => (t === "QUIET" || t === "NEW" ? "NOTABLE" : 
 // volatility-relative rather than a flat % threshold.
 const Z_CRITICAL = 3;
 const Z_NOTABLE = 1.5;
+
+/**
+ * Exported so the UI can show the same numbers it scores with, rather than
+ * hardcoding a second copy that silently drifts out of sync with the engine.
+ */
+export const SCORING_THRESHOLDS = {
+  zNotable: Z_NOTABLE,
+  zCritical: Z_CRITICAL,
+  volumeElevated: VOLUME_ELEVATED_RATIO,
+  volumeSurge: VOLUME_SURGE_RATIO,
+} as const;
 
 // Display/storage ceiling. The raw math is honest — a large real move over
 // a very short elapsed window (e.g. the dev shock injector fired seconds
@@ -155,6 +167,10 @@ export interface AttentionCard {
   zScore: number | null;
   /** True if zScore hit the display ceiling (MAX_DISPLAY_Z) — the real move was even larger. */
   zScoreClamped: boolean;
+  /** This stock's daily-equivalent volatility, the σ in the z-score. */
+  sigmaDaily: number | null;
+  /** σ × √(elapsed trading time): how big a move would have been ordinary over this window. */
+  expectedMovePct: number | null;
   tier: Tier;
   primaryReason: string;
   secondaryReasons: string[];
@@ -246,6 +262,8 @@ export function scoreSymbol(params: {
       sessionsMissed: 0,
       zScore: null,
       zScoreClamped: false,
+      sigmaDaily: volatility.sigma,
+      expectedMovePct: null,
       tier: "NEW",
       primaryReason: "New to your watchlist — baseline created.",
       secondaryReasons,
@@ -429,6 +447,8 @@ export function scoreSymbol(params: {
     sessionsMissed: elapsed.sessionOpens,
     zScore,
     zScoreClamped,
+    sigmaDaily: volatility.sigma,
+    expectedMovePct: expectedMoveForElapsed > 0 ? expectedMoveForElapsed : null,
     tier,
     primaryReason,
     secondaryReasons,

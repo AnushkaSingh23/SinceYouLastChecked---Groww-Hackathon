@@ -179,6 +179,31 @@ never escalates; the real facts still show as context.
 
 ---
 
+### "How is this calculated?"
+
+A sigma value is only an explanation if you can see what went into it —
+otherwise `6.0σ` is exactly the black-box score this app claims not to be. Every
+scored card has a collapsed panel showing the actual arithmetic with its own
+numbers:
+
+```
+Your baseline                ₹264.10   Sat, 10:50 pm IST
+Now                          ₹255.91
+Move since then              -3.10%
+Trading time away            none — market was closed
+
+This stock's daily swing     ±1.14%    from 3-month history
+Ordinary move for that window ±0.03%   σ × √time
+So this move is              6.0σ+     3.10% ÷ 0.03%
+
+Under 1.5σ is quiet · 1.5–3σ is notable · 3σ+ is critical.
+```
+
+The thresholds are imported from the scoring engine rather than retyped in the
+UI, so the panel cannot drift out of sync with what actually decided the tier.
+
+---
+
 ## Making "seen" actually mean something
 
 **Mark all as seen** sets your baseline; **got it** acknowledges one card.

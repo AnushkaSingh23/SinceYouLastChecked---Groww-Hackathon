@@ -8,6 +8,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 // whole category of risk: the compiler catches drift instead of a human
 // having to notice it). Type-only import, erased at compile time — no
 // runtime cost, and scoring.ts has no server-only dependencies.
+import { SCORING_THRESHOLDS } from "@/lib/scoring";
 import type { Tier, AttentionCard } from "@/lib/scoring";
 import type { LongTermTrend } from "@/lib/longTermTrend";
 
@@ -291,6 +292,113 @@ function MarketStatusBanner({
   );
 }
 
+/** One labelled line of the calculation. */
+function CalcRow({ label, value, note }: { label: string; value: string; note?: string }) {
+  return (
+    <div className="flex items-baseline justify-between gap-3 py-0.5">
+      <span className="shrink-0 text-fg-faint">{label}</span>
+      <span className="text-right">
+        <span className="font-mono text-fg">{value}</span>
+        {note && <span className="ml-1.5 text-fg-faint">{note}</span>}
+      </span>
+    </div>
+  );
+}
+
+/**
+ * Shows the actual arithmetic behind the tier, with this card's real numbers.
+ *
+ * The app claims every flag has a real answer to "why?". A sigma value is only
+ * that answer if you can see what went into it — otherwise "5.9σ" is exactly
+ * the black-box score the product says it isn't. Collapsed by default so it
+ * stays out of the way of the plain-English reason.
+ */
+function HowIsThisCalculated({ c, lastSeenMs }: { c: AttentionCard; lastSeenMs: number | null }) {
+  if (c.zScore === null || c.expectedMovePct === null || c.lastSeenPrice === null) return null;
+
+  const tradingMin = c.tradingElapsedMs !== null ? Math.round(c.tradingElapsedMs / 60_000) : null;
+  const parts = [
+    tradingMin === null || tradingMin < 1
+      ? null
+      : tradingMin < 60
+        ? `${tradingMin} min`
+        : `${(tradingMin / 60).toFixed(1)} hr`,
+    c.sessionsMissed > 0 ? `${c.sessionsMissed} market ${c.sessionsMissed === 1 ? "open" : "opens"}` : null,
+  ].filter(Boolean);
+  // Zero trading minutes is the normal case outside market hours, not an error.
+  const awayText = parts.length > 0 ? parts.join(" + ") : "none — market was closed";
+
+  return (
+    <details className="mt-2 text-xs">
+      <summary className="cursor-pointer list-none text-fg-muted underline decoration-dotted underline-offset-2 hover:text-fg">
+        How is this calculated? ▾
+      </summary>
+
+      <div className="mt-2 space-y-0.5 rounded border border-line bg-surface-muted px-3 py-2">
+        <CalcRow
+          label="Your baseline"
+          value={formatINR(c.lastSeenPrice)}
+          note={lastSeenMs !== null ? IST_DAY_CLOCK.format(new Date(lastSeenMs)) + " IST" : undefined}
+        />
+        <CalcRow label="Now" value={formatINR(c.currentPrice)} />
+        <CalcRow
+          label="Move since then"
+          value={`${c.priceChangePct >= 0 ? "+" : ""}${(c.priceChangePct * 100).toFixed(2)}%`}
+        />
+        <CalcRow label="Trading time away" value={awayText || "under a minute"} note="market hours only" />
+
+        <div className="my-1.5 border-t border-line" />
+
+        <CalcRow
+          label="This stock's daily swing"
+          value={`±${((c.sigmaDaily ?? 0) * 100).toFixed(2)}%`}
+          note={c.volatilityIsLive ? "measured live" : "from 3-month history"}
+        />
+        <CalcRow
+          label="Ordinary move for that window"
+          value={`±${(c.expectedMovePct * 100).toFixed(2)}%`}
+          note="σ × √time"
+        />
+        <CalcRow
+          label="So this move is"
+          value={`${c.zScore.toFixed(1)}σ${c.zScoreClamped ? "+" : ""}`}
+          note={`${(Math.abs(c.priceChangePct) * 100).toFixed(2)}% ÷ ${(c.expectedMovePct * 100).toFixed(2)}%`}
+        />
+
+        <p className="pt-1.5 text-fg-faint">
+          Under {SCORING_THRESHOLDS.zNotable}σ is quiet · {SCORING_THRESHOLDS.zNotable}–
+          {SCORING_THRESHOLDS.zCritical}σ is notable · {SCORING_THRESHOLDS.zCritical}σ+ is critical.
+        </p>
+
+        {c.volumeRatio !== null && c.volumeLevel !== "NORMAL" && (
+          <p className="text-fg-faint">
+            Volume is {c.volumeRatio.toFixed(1)}× its recent pace ({SCORING_THRESHOLDS.volumeElevated}×+ counts,{" "}
+            {SCORING_THRESHOLDS.volumeSurge}×+ held for two polls is critical on its own).
+          </p>
+        )}
+
+        {c.benchmarkChangePct !== null && c.relativeChangePct !== null && (
+          <p className="text-fg-faint">
+            {Math.abs(c.benchmarkChangePct) < 0.001 ? (
+              <>
+                {c.benchmarkName} was flat over the same window, so this move was the stock, not the market.
+              </>
+            ) : (
+              <>
+                {c.benchmarkName} moved {(c.benchmarkChangePct * 100).toFixed(2)}% over the same window, so{" "}
+                {(c.relativeChangePct * 100).toFixed(2)}% of this is specific to the stock
+                {c.isMarketDriven
+                  ? " — most of the move was the market, so the tier was stepped down one level."
+                  : "."}
+              </>
+            )}
+          </p>
+        )}
+      </div>
+    </details>
+  );
+}
+
 function Card({
   item,
   now,
@@ -372,7 +480,9 @@ function Card({
 
           {/* Market context: the same move means opposite things depending on
               whether the whole market moved with it. */}
-          {c.benchmarkChangePct !== null && c.relativeChangePct !== null && (
+          {c.benchmarkChangePct !== null &&
+            c.relativeChangePct !== null &&
+            Math.abs(c.benchmarkChangePct) >= 0.001 && (
             <p className="mt-1 text-xs text-fg-muted">
               {c.benchmarkName} {c.benchmarkChangePct >= 0 ? "+" : ""}
               {(c.benchmarkChangePct * 100).toFixed(2)}% over the same window ·{" "}
@@ -394,6 +504,8 @@ function Card({
               {r}
             </p>
           ))}
+
+          <HowIsThisCalculated c={c} lastSeenMs={lastSeenMs} />
 
           <div className="mt-3 flex flex-wrap items-center justify-between gap-x-3 gap-y-1 text-xs text-fg-faint">
             <span>
