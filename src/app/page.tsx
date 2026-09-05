@@ -292,6 +292,17 @@ function MarketStatusBanner({
   );
 }
 
+/**
+ * Percentages in the calculation panel need enough precision to actually
+ * reconcile: an expected move of 0.034% printed as "0.03%" turns the division
+ * shown next to it into visible nonsense.
+ */
+function pctPrecise(fraction: number): string {
+  const v = Math.abs(fraction * 100);
+  const digits = v < 0.1 ? 3 : 2;
+  return `${(fraction * 100).toFixed(digits)}%`;
+}
+
 /** One labelled line of the calculation. */
 function CalcRow({ label, value, note }: { label: string; value: string; note?: string }) {
   return (
@@ -356,13 +367,19 @@ function HowIsThisCalculated({ c, lastSeenMs }: { c: AttentionCard; lastSeenMs: 
         />
         <CalcRow
           label="Ordinary move for that window"
-          value={`±${(c.expectedMovePct * 100).toFixed(2)}%`}
+          value={`±${pctPrecise(c.expectedMovePct)}`}
           note="σ × √time"
         />
         <CalcRow
           label="So this move is"
           value={`${c.zScore.toFixed(1)}σ${c.zScoreClamped ? "+" : ""}`}
-          note={`${(Math.abs(c.priceChangePct) * 100).toFixed(2)}% ÷ ${(c.expectedMovePct * 100).toFixed(2)}%`}
+          // When the value is capped, showing the division alongside it prints
+          // arithmetic that doesn't reconcile. Say what was actually capped.
+          note={
+            c.zScoreClamped && c.zScoreRaw !== null
+              ? `capped for display · actually ${c.zScoreRaw.toFixed(0)}σ`
+              : `${pctPrecise(Math.abs(c.priceChangePct))} ÷ ${pctPrecise(c.expectedMovePct)}`
+          }
         />
 
         <p className="pt-1.5 text-fg-faint">

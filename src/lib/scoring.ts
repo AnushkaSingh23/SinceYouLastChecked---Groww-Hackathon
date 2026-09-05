@@ -167,6 +167,13 @@ export interface AttentionCard {
   zScore: number | null;
   /** True if zScore hit the display ceiling (MAX_DISPLAY_Z) — the real move was even larger. */
   zScoreClamped: boolean;
+  /**
+   * The uncapped z-score. The "How is this calculated?" panel needs this: it
+   * shows the division that produced the sigma, and printing "3.10% / 0.03% =
+   * 6.0σ+" is arithmetic that visibly doesn't add up — in the one place whose
+   * entire job is showing honest arithmetic.
+   */
+  zScoreRaw: number | null;
   /** This stock's daily-equivalent volatility, the σ in the z-score. */
   sigmaDaily: number | null;
   /** σ × √(elapsed trading time): how big a move would have been ordinary over this window. */
@@ -262,6 +269,7 @@ export function scoreSymbol(params: {
       sessionsMissed: 0,
       zScore: null,
       zScoreClamped: false,
+      zScoreRaw: null,
       sigmaDaily: volatility.sigma,
       expectedMovePct: null,
       tier: "NEW",
@@ -447,6 +455,7 @@ export function scoreSymbol(params: {
     sessionsMissed: elapsed.sessionOpens,
     zScore,
     zScoreClamped,
+    zScoreRaw: rawZ,
     sigmaDaily: volatility.sigma,
     expectedMovePct: expectedMoveForElapsed > 0 ? expectedMoveForElapsed : null,
     tier,

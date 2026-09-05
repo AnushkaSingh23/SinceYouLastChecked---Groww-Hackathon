@@ -318,9 +318,34 @@ overwrite newer ones, and repeated identical quotes are not learned twice —
 recording an untraded stock's unchanged quote as a fresh tick buries real
 returns under zeros, understates σ, and makes ordinary moves read as CRITICAL.
 
-**Data source:** Yahoo Finance's public v8 chart endpoint. The commonly
-recommended v7 batch endpoint now returns 401 without a session cookie and crumb
-token, so this uses v8 with a small concurrency cap instead of one batched call.
+**Data source: Yahoo Finance, and nothing else.** There are exactly four
+outbound call sites in the codebase, all to `query1.finance.yahoo.com`:
+
+| Module | Endpoint | Used for |
+|---|---|---|
+| `marketData.ts` | `/v8/finance/chart/<sym>?range=1d` | live quotes (the poll loop) |
+| `seedVolatility.ts` | `/v8/finance/chart/<sym>?range=3mo` | deriving σ from real history |
+| `longTermTrend.ts` | `/v8/finance/chart/<sym>?range=1y` | the 1M/3M/6M/1Y trend |
+| `symbolSearch.ts` | `/v1/finance/search?q=` | NSE symbol search |
+
+Three of those are the same endpoint with a different range. Nothing in the
+browser talks to the data source directly — every client call goes to this app's
+own `/api/...` routes.
+
+No API key, no auth, no account, which is why setup is four commands and the
+deployment needs no secrets.
+
+**That is also a single point of failure, and worth saying plainly.** The
+commonly recommended v7 batch endpoint *already broke this way*: it now returns
+401 without a session cookie and crumb token, which is why this uses v8 with a
+small concurrency cap instead of one batched call. The same could happen to v8.
+
+Two things blunt it, both already built: the poll loop backs off and reports
+**feed health** honestly rather than showing stale prices as if they were live,
+and every call site is one module behind a narrow interface — swapping providers
+means changing `marketData.ts`, not the scoring engine. A proper `QuoteProvider`
+abstraction with a fixture implementation for offline tests is the natural next
+step and is not built here.
 
 **Any NSE stock can be watched**, not a fixed list. Symbol search hits the
 exchange live, a new symbol is validated by whether it returns a real quote, and
@@ -410,3 +435,7 @@ Stated plainly, because knowing where a system is weak is part of building it.
   a stock is not yet compared against its own sector, so "ITC fell but so did
   all of FMCG" is still invisible.
 - **News headlines appear only on simulated events.**
+- **One upstream data provider.** See the data-source note above: it is
+  unauthenticated and undocumented, and its predecessor endpoint already broke
+  once. The app degrades honestly rather than lying about freshness, but it
+  cannot fail over.
