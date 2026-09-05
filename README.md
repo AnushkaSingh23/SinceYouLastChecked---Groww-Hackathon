@@ -32,7 +32,7 @@ Everything below follows from those two ideas.
 
 ## How the scoring works
 
-Four independent signals combine into one tier per stock, and every tier traces
+Five independent signals combine into one tier per stock, and every tier traces
 back to a plain-English sentence — so *"why was this flagged?"* always has a
 real answer. There is no black-box score.
 
@@ -112,7 +112,46 @@ positive:
   testing against the live feed at 3:10pm painted most of the list red on ~0.2%
   price moves.
 
-### 4. 52-week level breaks
+### 4. Market-relative context — is it the stock, or the whole market?
+
+The same drop means opposite things depending on what the market did:
+
+| | | |
+|---|---|---|
+| ITC **−3.1%** | NIFTY 50 **−0.2%** | something happened to ITC |
+| ITC **−3.1%** | NIFTY 50 **−2.9%** | the market fell; ITC came along |
+
+Before this the app said the same thing for both — which is the single biggest
+source of false urgency in an attention product. On a broad sell-off every card
+turns red, all of it technically true, none of it news about any one stock.
+
+Each symbol is judged against **NIFTY 50**, or **NIFTY Bank** for banks and
+financials, which move together far more tightly than the market as a whole.
+The index level is recorded alongside the price at "mark as seen", so the
+comparison spans exactly the same window as the stock's own move — comparing a
+since-you-last-checked move against the index's since-yesterday move would span
+two different windows and mean nothing.
+
+When the index explains most of the move, the tier steps **down one level** and
+says so. Three deliberate limits on that:
+
+- **Only when the price signal drove the tier.** A 52-week break or a confirmed
+  volume surge is a fact about *this* stock that the index does not explain
+  away, so those keep their tier.
+- **Only when the stock moved *with* the market.** Falling while the market
+  rises is the opposite of market-driven and is never softened.
+- **Judged as a proportion, not a z-score on the residual.** Scoring the
+  leftover by z makes the answer depend on how long you were away — over a
+  20-second window a 0.2% divergence is already >5σ, so a market-wide drop would
+  never be recognised on a short visit. "How much of this was the market?" is a
+  question about decomposing the move, and should give the same answer at any
+  elapsed time.
+
+The residual uses beta = 1 rather than a fitted beta: a per-symbol beta needs
+history this app doesn't keep, and "did it move more than the market?" is the
+question people actually ask.
+
+### 5. 52-week level breaks
 
 Flags a stock crossing its 52-week high or low. If the data source omits a
 bound, it is treated as **unknown**, never as "crossed" — defaulting a missing
@@ -342,7 +381,7 @@ Stated plainly, because knowing where a system is weak is part of building it.
 - **Only verified NSE holidays are in the calendar.** A wrong holiday is worse
   than a missing one — it would make the app claim "closed" on a real trading
   day.
-- **No sector- or index-relative context.** *"ITC is down 3.1% while FMCG is
-  flat"* and *"ITC is down 3.1% and FMCG is down 2.9%"* are completely different
-  news; the app currently says the same thing for both.
+- **Index-relative, not sector-relative.** NIFTY 50 and NIFTY Bank are covered;
+  a stock is not yet compared against its own sector, so "ITC fell but so did
+  all of FMCG" is still invisible.
 - **News headlines appear only on simulated events.**

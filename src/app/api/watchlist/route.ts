@@ -43,6 +43,8 @@ export async function GET() {
             timestamp: item.lastSeen.timestamp.getTime(),
             levelBreak: item.lastSeen.levelBreak,
             volumeRatio: item.lastSeen.volumeRatio,
+            benchmarkSymbol: item.lastSeen.benchmarkSymbol,
+            benchmarkPrice: item.lastSeen.benchmarkPrice,
           }
         : null;
       const meta = SYMBOL_META.get(item.symbol);

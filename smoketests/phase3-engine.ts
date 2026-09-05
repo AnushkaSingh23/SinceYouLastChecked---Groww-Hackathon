@@ -149,6 +149,94 @@ check(
   priceAndVolume.tier === "CRITICAL"
 );
 
+// Test 2d: market-relative context. The same -3.1% means opposite things
+// depending on whether the whole market moved with it, and this is the single
+// biggest source of false urgency in an attention product: on a broad sell-off
+// every card turns red and none of it is news about any one stock.
+const drop31 = makeQuote({ price: 96.9, prevClose: 100 });
+const scoreVsMarket = (indexPct: number | null) =>
+  scoreSymbol({
+    quote: drop31,
+    now: FRI_1400,
+    lastSeen: { price: 100, timestamp: FRI_1300 },
+    volatility: { sigma: 0.02, isLive: true },
+    volumeAnomaly: NO_VOLUME_SIGNAL,
+    benchmark: indexPct === null ? null : { symbol: "^NSEI", name: "NIFTY 50", changePct: indexPct },
+  });
+
+const noBenchmark = scoreVsMarket(null);
+const stockSpecific = scoreVsMarket(-0.002); // market flat, stock -3.1%
+const marketWide = scoreVsMarket(-0.029); //    market -2.9%, stock -3.1%
+
+check(
+  `with no benchmark the tier is unchanged from before benchmarks existed (got ${noBenchmark.tier})`,
+  noBenchmark.tier === "CRITICAL" && noBenchmark.benchmarkName === null
+);
+check(
+  `-3.1% while NIFTY is -0.2% stays CRITICAL — that is the stock (got ${stockSpecific.tier})`,
+  stockSpecific.tier === "CRITICAL" && stockSpecific.isMarketDriven === false
+);
+check(
+  `-3.1% while NIFTY is -2.9% is demoted — that is the market (got ${marketWide.tier})`,
+  marketWide.tier === "NOTABLE" && marketWide.isMarketDriven === true
+);
+check(
+  "the demoted card explains itself in terms of the market",
+  marketWide.primaryReason.includes("NIFTY 50") && marketWide.primaryReason.includes("market")
+);
+check(
+  `the residual is reported, not just the raw move (got ${(marketWide.relativeChangePct! * 100).toFixed(2)}%)`,
+  Math.abs(marketWide.relativeChangePct! - -0.002) < 1e-9
+);
+
+// "How much of this was the market?" must not depend on how long you were
+// away. Judging the residual by z-score made it timescale-dependent: over a
+// 20-second window a 0.2% divergence is already >5 sigma, so a market-wide
+// drop would never be recognised on a short visit — which is exactly the case
+// a live demo hits. Same decomposition, same answer, any elapsed time.
+const marketWideSeconds = scoreSymbol({
+  quote: drop31,
+  now: FRI_1400,
+  lastSeen: { price: 100, timestamp: FRI_1400 - 20_000 },
+  volatility: { sigma: 0.02, isLive: true },
+  volumeAnomaly: NO_VOLUME_SIGNAL,
+  benchmark: { symbol: "^NSEI", name: "NIFTY 50", changePct: -0.029 },
+});
+check(
+  `a market-wide drop is recognised 20 seconds after mark-seen too (got ${marketWideSeconds.tier})`,
+  marketWideSeconds.isMarketDriven === true && marketWideSeconds.tier === "NOTABLE"
+);
+
+// A stock falling while the market RISES is not market-driven — it is the
+// opposite, and must never be softened.
+const fellAgainstARisingMarket = scoreVsMarket(0.025);
+check(
+  `falling 3.1% while the market rose 2.5% is never demoted (got ${fellAgainstARisingMarket.tier})`,
+  fellAgainstARisingMarket.tier === "CRITICAL" && fellAgainstARisingMarket.isMarketDriven === false
+);
+
+// A barely-moving index explains nothing, so it must not soften anything.
+const flatIndex = scoreVsMarket(-0.0005);
+check(
+  `an index that barely moved never marks a move as market-driven (got ${flatIndex.tier})`,
+  flatIndex.tier === "CRITICAL" && flatIndex.isMarketDriven === false
+);
+
+// A 52-week break or volume surge is a fact about THIS stock that the index
+// does not explain away, so a corroborated move keeps its tier.
+const marketWidePlusVolume = scoreSymbol({
+  quote: drop31,
+  now: FRI_1400,
+  lastSeen: { price: 100, timestamp: FRI_1300 },
+  volatility: { sigma: 0.02, isLive: true },
+  volumeAnomaly: volume(4.2),
+  benchmark: { symbol: "^NSEI", name: "NIFTY 50", changePct: -0.029 },
+});
+check(
+  `a market-wide drop WITH a confirmed volume surge is not softened (got ${marketWidePlusVolume.tier})`,
+  marketWidePlusVolume.tier === "CRITICAL"
+);
+
 // Test 3: level break triggers regardless of small price move.
 const levelBreakQuote = makeQuote({ price: 150.5, high52w: 150, prevClose: 150.2 });
 const levelBreakResult = scoreSymbol({

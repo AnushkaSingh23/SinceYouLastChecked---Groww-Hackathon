@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { getCurrentUserId } from "@/lib/auth";
 import { marketFeedStore } from "@/lib/marketFeedStore";
+import { isBenchmark } from "@/lib/benchmarks";
 
 // Dev/demo-only: inject or clear a simulated market event on a symbol.
 // Not user-scoped — this overlays the shared live feed everyone sees, which
@@ -40,7 +41,10 @@ export async function POST(request: Request) {
   // capped at 40 symbols, so the demo control must not be either. A shock only
   // means anything for a symbol the feed is already tracking, which is exactly
   // the set that has a quote cached.
-  if (!/^[A-Z0-9&._-]{1,20}\.NS$/.test(symbol)) {
+  // Benchmarks are shockable too: simulating a market-wide sell-off is the
+  // only way to demonstrate that a stock falling *with* the market gets
+  // softened rather than shouted about.
+  if (!isBenchmark(symbol) && !/^[A-Z0-9&._-]{1,20}\.NS$/.test(symbol)) {
     return NextResponse.json({ error: "Not a valid NSE symbol" }, { status: 400 });
   }
   if (!marketFeedStore.getQuote(symbol)) {

@@ -370,6 +370,19 @@ function Card({
             </p>
           )}
 
+          {/* Market context: the same move means opposite things depending on
+              whether the whole market moved with it. */}
+          {c.benchmarkChangePct !== null && c.relativeChangePct !== null && (
+            <p className="mt-1 text-xs text-fg-muted">
+              {c.benchmarkName} {c.benchmarkChangePct >= 0 ? "+" : ""}
+              {(c.benchmarkChangePct * 100).toFixed(2)}% over the same window ·{" "}
+              <span className={c.isMarketDriven ? "text-fg-faint" : "font-medium text-fg"}>
+                {c.relativeChangePct >= 0 ? "+" : ""}
+                {(c.relativeChangePct * 100).toFixed(2)}% vs the market
+              </span>
+            </p>
+          )}
+
           <p className="mt-2 text-sm text-fg">{c.primaryReason}</p>
           {c.newsHeadline && <p className="mt-1 text-xs italic text-accent">&ldquo;{c.newsHeadline}&rdquo;</p>}
           {c.secondaryReasons.map((r) => (

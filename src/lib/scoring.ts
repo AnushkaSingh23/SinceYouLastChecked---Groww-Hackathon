@@ -93,6 +93,34 @@ function volumeWeight(level: VolumeLevel, sustained: boolean): number {
 /** Total signal weight at which the tier is bumped one level. */
 const ESCALATION_WEIGHT = 2;
 
+// Below this the index barely moved, so it explains nothing and no
+// market-relative claim should be made either way.
+const BENCHMARK_MEANINGFUL_MOVE = 0.003; // 0.3%
+
+// A move is "market-driven" when the index explains most of it — i.e. what is
+// left after removing the market is at most this fraction of the original move.
+// 0.35 means the index accounts for roughly two thirds or more.
+//
+// Deliberately a PROPORTION, not a z-score on the residual. Judging the
+// leftover by z makes the answer depend on how long you were away: over a
+// 20-second window a 0.2% divergence is already >5 sigma, so nothing would ever
+// be called market-driven on a short visit — while over a week almost
+// everything would be. "How much of this was the market?" is a question about
+// the decomposition of the move, not about elapsed time, so it should give the
+// same answer either way.
+const MARKET_DRIVEN_RESIDUAL_FRACTION = 0.35;
+
+/**
+ * The benchmark index's move over exactly the same window as the stock's.
+ * Absent when the index level wasn't recorded at acknowledgement time.
+ */
+export interface BenchmarkContext {
+  symbol: string;
+  name: string;
+  /** Fractional change since the user last checked, e.g. -0.029 for -2.9%. */
+  changePct: number;
+}
+
 export interface LastSeen {
   price: number;
   timestamp: number;
@@ -104,6 +132,9 @@ export interface LastSeen {
    */
   levelBreak?: boolean;
   volumeRatio?: number | null;
+  /** Benchmark index level when acknowledged, so the comparison spans the same window. */
+  benchmarkSymbol?: string | null;
+  benchmarkPrice?: number | null;
 }
 
 export interface AttentionCard {
@@ -131,6 +162,14 @@ export interface AttentionCard {
   isVolumeAnomaly: boolean;
   volumeLevel: VolumeLevel;
   volumeRatio: number | null;
+  /** Benchmark index this was judged against, when one was available. */
+  benchmarkName: string | null;
+  /** The index's move over the same window. */
+  benchmarkChangePct: number | null;
+  /** The stock's move with the index's move removed — what's specific to this stock. */
+  relativeChangePct: number | null;
+  /** True when the index explains most of the move: it went with the market, not on its own news. */
+  isMarketDriven: boolean;
   volatilityIsLive: boolean;
   dataFreshnessSec: number;
   /** Set by marketFeedStore when a dev shock override is active for this symbol — scoring.ts itself doesn't know about shocks. */
@@ -152,8 +191,11 @@ export function scoreSymbol(params: {
   lastSeen: LastSeen | null;
   volatility: VolatilityResult;
   volumeAnomaly: VolumeAnomalyResult;
+  /** Optional. When absent, scoring behaves exactly as it did before benchmarks existed. */
+  benchmark?: BenchmarkContext | null;
 }): AttentionCard {
   const { quote, lastSeen, volatility, volumeAnomaly } = params;
+  const benchmark = params.benchmark ?? null;
   const now = params.now ?? Date.now();
 
   // high52w/low52w are null when Yahoo's response omits them — treat that
@@ -211,6 +253,11 @@ export function scoreSymbol(params: {
       isVolumeAnomaly: volumeLevel !== "NORMAL",
       volumeLevel,
       volumeRatio: volumeAnomaly.ratio,
+      // A never-checked stock has no window to compare an index over.
+      benchmarkName: null,
+      benchmarkChangePct: null,
+      relativeChangePct: null,
+      isMarketDriven: false,
       volatilityIsLive: volatility.isLive,
       dataFreshnessSec,
     };
@@ -249,6 +296,29 @@ export function scoreSymbol(params: {
     zScoreClamped = true;
   }
   const zScoreLabel = (z: number) => `${z.toFixed(1)}σ${zScoreClamped ? "+" : ""}`;
+
+  // How much of this move is the stock, and how much is just the market?
+  //
+  // The residual is the plain difference (i.e. beta assumed to be 1) rather
+  // than a regression-fitted beta. That is deliberate: a fitted beta needs a
+  // per-symbol history this app doesn't keep, and would make the number harder
+  // to explain on a card. Beta-1 answers the question people actually ask —
+  // "did it move more than the market?" — and is honest about being a
+  // simplification.
+  const benchmarkChangePct = benchmark ? benchmark.changePct : null;
+  const relativeChangePct = benchmarkChangePct !== null ? priceChangePct - benchmarkChangePct : null;
+  // Only claim a move was market-driven when the index actually moved, the
+  // stock moved *with* it rather than against it, and the index explains most
+  // of the move rather than a sliver of it.
+  const indexMovedMeaningfully =
+    benchmarkChangePct !== null && Math.abs(benchmarkChangePct) >= BENCHMARK_MEANINGFUL_MOVE;
+  const sameDirection =
+    benchmarkChangePct !== null && Math.sign(benchmarkChangePct) === Math.sign(priceChangePct);
+  const marketExplainsMost =
+    relativeChangePct !== null &&
+    Math.abs(priceChangePct) > 0 &&
+    Math.abs(relativeChangePct) <= MARKET_DRIVEN_RESIDUAL_FRACTION * Math.abs(priceChangePct);
+  const isMarketDriven = indexMovedMeaningfully && sameDirection && marketExplainsMost;
 
   // A level break the user already acknowledged is not news. Without this,
   // a stock sitting at its 52-week high stays NOTABLE forever no matter how
@@ -308,6 +378,33 @@ export function scoreSymbol(params: {
   // without a price signal having to do all the work.
   if (signalWeight >= ESCALATION_WEIGHT) tier = escalate(tier);
 
+  // Step the tier back down when the move was the market, not the stock.
+  //
+  // This is the point of tracking benchmarks at all. On a broad sell-off every
+  // holding drops together and the whole list turns red — technically true,
+  // and useless: none of it is news about any individual stock. Demoting one
+  // level keeps it visible with an honest explanation instead of shouting.
+  //
+  // Deliberately only ONE level, and only when the price signal is what drove
+  // the tier. A 52-week break or a volume surge is a fact about this stock that
+  // the index does not explain away, so those keep their tier.
+  const priceDroveTheTier = rawZ !== null && rawZ >= Z_NOTABLE;
+  if (isMarketDriven && priceDroveTheTier && signalWeight <= WEIGHT_PRICE) {
+    tier = tier === "CRITICAL" ? "NOTABLE" : "QUIET";
+    primaryReason =
+      tier === "QUIET"
+        ? `Moved ${(priceChangePct * 100).toFixed(1)}% with the market — ${benchmark!.name} is ${(benchmarkChangePct! * 100).toFixed(1)}%.`
+        : `Price moved ${(priceChangePct * 100).toFixed(1)}%, but ${benchmark!.name} is ${(benchmarkChangePct! * 100).toFixed(1)}% — mostly the market, not the stock.`;
+  } else if (benchmark && indexMovedMeaningfully && tier !== "QUIET") {
+    // Not market-driven, and the index moved: say so, because "it fell while
+    // the market rose" is a stronger signal than the raw percentage alone.
+    secondaryReasons.push(
+      `${benchmark.name} is ${(benchmarkChangePct! * 100).toFixed(1)}% over the same window — ${
+        relativeChangePct! >= 0 ? "+" : ""
+      }${(relativeChangePct! * 100).toFixed(1)}% of this is specific to the stock.`
+    );
+  }
+
   // A level break the user already knows about is still a true fact about
   // the stock — it just isn't news. Keep it visible as context so the card
   // doesn't silently drop information, without letting it drive the tier.
@@ -339,6 +436,10 @@ export function scoreSymbol(params: {
     isVolumeAnomaly: volumeLevel !== "NORMAL",
     volumeLevel,
     volumeRatio: volumeAnomaly.ratio,
+    benchmarkName: benchmark?.name ?? null,
+    benchmarkChangePct,
+    relativeChangePct,
+    isMarketDriven,
     volatilityIsLive: volatility.isLive,
     dataFreshnessSec,
   };

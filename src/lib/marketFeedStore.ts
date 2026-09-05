@@ -15,6 +15,7 @@ import { scoreSymbol, type AttentionCard, type LastSeen } from "./scoring";
 import { ShockInjector, type ShockOverride } from "./shockInjector";
 import { getNSEMarketStatus } from "./marketHours";
 import { warmSeedVolatility } from "./seedVolatility";
+import { BENCHMARK_SYMBOLS, benchmarkFor, isBenchmark } from "./benchmarks";
 
 // While the market is open, quotes move and 20s is a sensible cadence.
 // While it's closed they cannot move, so polling at the same rate is
@@ -72,9 +73,18 @@ class MarketFeedStore {
   private tracked = new Set<string>();
 
   constructor() {
+    // Benchmarks first: they are scoring inputs, not watchlist items, so they
+    // are always polled regardless of what anyone watches — and they must
+    // never be crowded out by the tracked-symbol cap.
+    this.ensureTracked(BENCHMARK_SYMBOLS);
     // The curated universe is only a warm starting set now, not the ceiling —
     // any NSE symbol can be added at runtime through ensureTracked().
     this.ensureTracked(NSE_40_UNIVERSE.map((s) => s.symbol));
+  }
+
+  /** Current level of a benchmark index, for recording a baseline at mark-seen time. */
+  getBenchmarkPrice(symbol: string): number | null {
+    return this.quotes.get(symbol)?.price ?? null;
   }
 
   /**
@@ -177,11 +187,32 @@ class MarketFeedStore {
         }
       : volumeTracker.getLastResult();
 
+    // Market context: how did the relevant index move over the SAME window?
+    // Requires the index level recorded when the user acknowledged this stock;
+    // without it the only comparison available spans a different window and
+    // the residual would be meaningless, so we simply don't claim one.
+    const bm = benchmarkFor(symbol);
+    const bmBaseline = lastSeen?.benchmarkSymbol === bm.symbol ? lastSeen.benchmarkPrice ?? null : null;
+    // Apply the index's own shock override if one is active, so a simulated
+    // market-wide move actually behaves like one.
+    const bmRaw = this.quotes.get(bm.symbol)?.price ?? null;
+    const bmShock = this.shocks.get(bm.symbol);
+    const bmNow =
+      bmRaw !== null && bmShock?.priceOverridePct !== undefined
+        ? bmRaw * (1 + bmShock.priceOverridePct)
+        : bmRaw;
+    const benchmark =
+      bmBaseline !== null && bmBaseline > 0 && bmNow !== null
+        ? { symbol: bm.symbol, name: bm.name, changePct: (bmNow - bmBaseline) / bmBaseline }
+        : null;
+
     const card = scoreSymbol({
       quote: effectiveQuote,
       lastSeen,
       volatility: tracker.getEffectiveVolatility(),
       volumeAnomaly: effectiveVolumeAnomaly,
+      // An index is not judged against itself.
+      benchmark: isBenchmark(symbol) ? null : benchmark,
     });
 
     if (shock) {

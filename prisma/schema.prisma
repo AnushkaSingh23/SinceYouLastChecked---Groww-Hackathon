@@ -56,4 +56,12 @@ model LastSeenSnapshot {
   // these so every signal is genuinely "since you last checked."
   levelBreak  Boolean @default(false)
   volumeRatio Float?
+
+  // The benchmark index level at the moment this was acknowledged, so the
+  // market-relative comparison covers exactly the same window as the stock's
+  // own move. Without it the only option is comparing "since you last checked"
+  // against the index's move "since yesterday's close" — two different windows,
+  // which makes the residual meaningless.
+  benchmarkSymbol String?
+  benchmarkPrice  Float?
 }

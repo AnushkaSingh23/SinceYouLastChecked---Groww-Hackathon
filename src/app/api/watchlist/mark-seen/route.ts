@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { getCurrentUserId } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
 import { marketFeedStore } from "@/lib/marketFeedStore";
+import { benchmarkFor } from "@/lib/benchmarks";
 
 // Marks one symbol (or the whole watchlist, if no symbol given) as seen at
 // its current live state — this is what flattens tiers back to QUIET and is
@@ -33,7 +34,14 @@ export async function POST(request: Request) {
   // halfway through a sequential loop leaves a half-marked baseline, which
   // for this product means a permanently inconsistent "since you last
   // checked" reading for the symbols that didn't make it.
-  const pending: { itemId: string; price: number; levelBreak: boolean; volumeRatio: number | null }[] = [];
+  const pending: {
+    itemId: string;
+    price: number;
+    levelBreak: boolean;
+    volumeRatio: number | null;
+    benchmarkSymbol: string | null;
+    benchmarkPrice: number | null;
+  }[] = [];
   let skipped = 0;
 
   for (const item of items) {
@@ -54,24 +62,42 @@ export async function POST(request: Request) {
       continue;
     }
 
+    // Record where the benchmark index stood too, so the next visit can ask
+    // "did this stock move, or did the whole market?" over exactly the same
+    // window. Comparing a since-you-last-checked move against the index's
+    // since-yesterday move would span two different windows and mean nothing.
+    const bm = benchmarkFor(item.symbol);
+    const bmPrice = marketFeedStore.getBenchmarkPrice(bm.symbol);
+
     pending.push({
       itemId: item.id,
       price: card.currentPrice,
       levelBreak: card.isLevelBreak,
       volumeRatio: card.volumeRatio,
+      benchmarkSymbol: bmPrice !== null ? bm.symbol : null,
+      benchmarkPrice: bmPrice,
     });
   }
 
   const writes = pending.map((p) =>
     prisma.lastSeenSnapshot.upsert({
       where: { watchlistItemId: p.itemId },
-      update: { price: p.price, timestamp: now, levelBreak: p.levelBreak, volumeRatio: p.volumeRatio },
+      update: {
+        price: p.price,
+        timestamp: now,
+        levelBreak: p.levelBreak,
+        volumeRatio: p.volumeRatio,
+        benchmarkSymbol: p.benchmarkSymbol,
+        benchmarkPrice: p.benchmarkPrice,
+      },
       create: {
         watchlistItemId: p.itemId,
         price: p.price,
         timestamp: now,
         levelBreak: p.levelBreak,
         volumeRatio: p.volumeRatio,
+        benchmarkSymbol: p.benchmarkSymbol,
+        benchmarkPrice: p.benchmarkPrice,
       },
     })
   );
