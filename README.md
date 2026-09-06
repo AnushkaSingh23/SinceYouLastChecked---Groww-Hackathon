@@ -261,8 +261,12 @@ Open <http://localhost:3000>.
    outside those hours there is genuinely nothing to see — this injects a
    realistic price move, volume spike and headline so the scoring can be
    demonstrated on demand.
-5. Watch the card jump to **CRITICAL** with a reason. Filter with the tabs
-   (All / Needs attention / New / Unchanged).
+5. Watch the card jump to **NOTABLE** or **CRITICAL** with a reason. Click it a
+   few times: the presets cycle rather than picking at random and deliberately
+   span the range, including volume-only events that reach CRITICAL with no
+   price move at all. An earlier set all carried a 1%+ price move and every one
+   came out CRITICAL, which hid the fact that the engine discriminates at all.
+   Filter with the tabs (All / Needs attention / New / Unchanged).
 6. Click **got it** to acknowledge it and return the list to quiet.
 
 `bash demo-setup.sh` arms all of this in one command.

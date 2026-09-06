@@ -124,12 +124,32 @@ const TABS: { id: TabId; label: string }[] = [
 // Dev/demo presets — NSE is only live ~6 hours total across this hackathon's
 // window, so this is how CRITICAL/NOTABLE states get demonstrated on demand
 // rather than waiting for the market to cooperate. See shockInjector.ts.
+// Every preset used to carry a price move of at least 1%, and every one of them
+// came out CRITICAL — verified against the deployed app, five for five. Not an
+// engine fault: a shock lands seconds after "mark as seen", so elapsed trading
+// time sits at its floor and an ordinary move over that window is ~0.03%. Any
+// 1% move is 30 sigma, clamped to 6.0σ+, red every time.
+//
+// That hid the two things most worth showing — that the engine discriminates at
+// all, and that volume escalates on its own. So the set now spans the range.
+//
+// The volume-only entries are the reliable ones: with no price override there
+// is no move to divide by a near-zero expected move, so their tier depends only
+// on the ratio and comes out the same every time, on any stock, at any elapsed
+// time. The price-driven ones are inherently CRITICAL for the reason above, and
+// that is fine — they tell the "something happened to this company" story.
 const SHOCK_PRESETS = [
+  // Volume alone, below the surge threshold -> NOTABLE.
+  { priceOverridePct: 0, volumeAnomalyRatio: 2.2, headline: "Unusual volume ahead of a scheduled board meeting" },
+  // Price + volume together -> CRITICAL.
   { priceOverridePct: -0.062, volumeAnomalyRatio: 4.1, headline: "Q2 earnings miss street estimates by 9%" },
+  // Volume alone, a confirmed surge -> CRITICAL with no price move at all.
+  // This is the clearest demonstration of volume-driven escalation.
+  { priceOverridePct: 0, volumeAnomalyRatio: 4.5, headline: "Block deal reported on the exchange" },
+  // Elevated volume, flat price -> NOTABLE again, different story.
+  { priceOverridePct: 0, volumeAnomalyRatio: 2.6, headline: "Bulk deal chatter ahead of results" },
+  // A large upward move -> CRITICAL.
   { priceOverridePct: 0.081, volumeAnomalyRatio: 5.3, headline: "Board approves surprise share buyback" },
-  { priceOverridePct: -0.045, volumeAnomalyRatio: 3.2, headline: "Regulatory probe reported by newswires" },
-  { priceOverridePct: 0.055, volumeAnomalyRatio: 2.8, headline: "Analyst upgrade cites strong Q3 guidance" },
-  { priceOverridePct: 0.01, volumeAnomalyRatio: 6.5, headline: "Unusual volume ahead of scheduled board meeting" },
 ];
 
 function useIdentity() {
@@ -749,6 +769,8 @@ export default function Home() {
   // and an older response overwriting a newer one is the same class of bug
   // the server-side monotonicity guard fixes for quotes.
   const requestSeq = useRef(0);
+  /** Cycles through the demo presets so repeated clicks show different tiers. */
+  const presetIndex = useRef(0);
 
   const refresh = useCallback(() => {
     const seq = ++requestSeq.current;
@@ -858,7 +880,11 @@ export default function Home() {
   };
 
   const simulateEvent = async (symbol: string) => {
-    const preset = SHOCK_PRESETS[Math.floor(Math.random() * SHOCK_PRESETS.length)];
+    // Rotate rather than pick at random: a random draw can repeat the same
+    // preset several times running, which is exactly what makes the tiering
+    // look like it only has one state.
+    const preset = SHOCK_PRESETS[presetIndex.current % SHOCK_PRESETS.length];
+    presetIndex.current += 1;
     const res = await fetch("/api/dev/shock", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
