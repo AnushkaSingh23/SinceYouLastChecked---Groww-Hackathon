@@ -45,8 +45,8 @@ z = |% move since you last checked| / (σ × √(elapsed trading time))
 - **σ** is the stock's daily-equivalent volatility. It starts from a seed
   **derived from that symbol's own 3-month price history**, then switches to
   **live-observed** volatility once enough real ticks arrive this session. The
-  card tells you which is in use (`live volatility` vs `seed volatility
-  (warming up)`) rather than hiding it.
+  card tells you which is in use (`live volatility` vs `volatility from
+  3-month history`) rather than hiding it.
 - **√(elapsed time)** is standard square-root-of-time scaling — the same maths
   behind annualising a daily volatility. A move is more surprising the less time
   it had to happen in.
@@ -232,7 +232,9 @@ Every card shows the diff explicitly:
 - **Feed health.** The "data as of" time is the last time data was actually
   *received*, never the last attempt — the banner used to stay confident while
   every symbol was failing.
-- It says when volatility is still seeded rather than learned.
+- It says whether a stock's volatility is **measured live this session** or
+  still **derived from its 3-month history**, rather than presenting both as
+  equally settled.
 
 ---
 

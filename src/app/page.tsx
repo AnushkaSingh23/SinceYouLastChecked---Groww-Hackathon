@@ -546,7 +546,11 @@ function Card({
 
           <div className="mt-3 flex flex-wrap items-center justify-between gap-x-3 gap-y-1 text-xs text-fg-faint">
             <span>
-              {c.volatilityIsLive ? "live volatility" : "seed volatility (warming up)"} · data{" "}
+              {/* "warming up" was accurate when the seed was a hardcoded constant.
+                  It is now derived from this symbol's own 3-month history, so
+                  saying so undersells it less — and matches what the
+                  calculation panel already reports. */}
+              {c.volatilityIsLive ? "live volatility" : "volatility from 3-month history"} · data{" "}
               {formatAge(c.dataFreshnessSec)} old
             </span>
             <span className="flex items-center gap-3">
